@@ -11,12 +11,15 @@ use std::env;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use visitdir::VisitDir;
 
 const NUM_CAT_ONCE_DEFATLT: usize = 32;
 static NUM_CAT_ONCE: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(NUM_CAT_ONCE_DEFATLT));
+
+static USE_NEW_CAT: AtomicBool = AtomicBool::new(false);
 
 fn set_loglevel(loglevel: &str) {
     std::env::set_var("RUST_LOG", loglevel);
@@ -39,12 +42,9 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
 
     opts.optopt("n", "number", "number", "");
     opts.optflag("h", "help", "Print this message.");
-    opts.optopt("", "log", "debug, info, warn, error", "");
-
-    if args.iter().any(|e| e == "--test") {
-        //test_code();
-        unreachable!();
-    }
+    opts.optopt("", "log", "One of error, warn, info, debug, trace.", "");
+    opts.optflag("v", "verbose", "Same as --log debug.");
+    opts.optflag("", "v2", "Use different concatinate functino.");
 
     let matches = opts.parse(&args[1..])?;
 
@@ -56,6 +56,14 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     if matches.opt_present("log") {
         let loglevel = matches.opt_str("log").unwrap_or_else(|| "info".to_string());
         set_loglevel(&loglevel);
+    }
+
+    if matches.opt_present("v") {
+        set_loglevel("debug");
+    }
+
+    if matches.opt_present("v2") {
+        USE_NEW_CAT.store(true, std::sync::atomic::Ordering::Release);
     }
 
     if matches.opt_present("number") {
@@ -77,14 +85,17 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
 // Append the content of file2 to file1.
 // file1 will be modified.
 // file2.. will be removed.
-fn cat(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn catv1(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     log::trace!("Reconstructing {files:?}");
     if files.len() <= 1 {
         return Ok(());
     }
-    if files.first().unwrap().is_empty() {
-        return Ok(());
+    for file in files.iter() {
+        if file.is_empty() {
+            panic!("(BUG) Filename is empty.");
+        }
     }
+
     let f1 = std::fs::OpenOptions::new().append(true).open(&files[0])?;
     let mut buf1 = std::io::BufWriter::new(f1);
 
@@ -93,19 +104,82 @@ fn cat(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        // Skip this file
-        if std::fs::metadata(&file).is_err() {
-            continue;
-        }
-
-        let f2 = std::fs::File::open(&file)?;
+        let f2 = std::fs::File::open(file)?;
         let mut buf2 = std::io::BufReader::new(f2);
 
         let mut b: Vec<u8> = Vec::new();
         buf2.read_to_end(&mut b)?;
         buf1.write_all(&b)?;
-        std::fs::remove_file(&file)?;
+        std::fs::remove_file(file)?;
     }
+
+    Ok(())
+}
+
+/// Append the content of file2 to file1.
+/// file1 will be modified.
+/// file2.. will be removed.
+/// Returns String object of file1.
+/// If opening a file fails, sleep a while and retries infinitely.
+fn catv2(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::{remove_file, File, OpenOptions};
+    use std::io::{self, Seek, SeekFrom, Write};
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    fn open_with_retry(path: &str, options: &OpenOptions) -> io::Result<File> {
+        loop {
+            match options.open(path) {
+                Ok(f) => return Ok(f),
+                Err(e) => {
+                    // 簡単なバックオフ（固定）
+                    sleep(Duration::from_millis(100));
+                    // ループして再試行（無限リトライ）
+                    let _ = e; // エラーを破棄（必要ならログへ出力）
+                }
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    // file1 を開く（追記モード）。存在しなければ作成。
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).append(true);
+    let mut file1 = open_with_retry(&files[0], &opts)?;
+
+    // file2.. を順に開いて内容を file1 にコピーし、その後削除
+    for src_path in files.iter().skip(1) {
+        // 読み取りモードで開く（無限リトライ）
+        let mut ropts = OpenOptions::new();
+        ropts.read(true);
+        let mut src = open_with_retry(src_path, &ropts)?;
+
+        // copy を行うために、src の先頭へシーク（念のため）
+        let _ = src.seek(SeekFrom::Start(0));
+
+        // std::io::copy を使用して src -> file1
+        // 注意: append モードの file1 は内部的に末尾へ書き込まれるが、
+        // 複数ファイルを順にコピーするので問題ない。
+        io::copy(&mut src, &mut file1)?;
+
+        // コピー完了後、src ファイルを閉じて削除
+        drop(src);
+        // 削除にもリトライをかける（簡易実装）
+        loop {
+            match remove_file(src_path) {
+                Ok(_) => break,
+                Err(_) => {
+                    sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    // 変更をフラッシュ
+    file1.flush()?;
 
     Ok(())
 }
@@ -141,47 +215,46 @@ fn find_all_files_to_reconstruct2(
 }
 
 fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = String> + Send {
+    log::trace!("[reconstruct_async] {fragment_filenames:?}");
     async move {
-        match fragment_filenames.len() {
-            0 => unreachable!(),
-            1 => return fragment_filenames[0].clone(),
-            2 => {
-                // cat!
-                cat(&fragment_filenames).unwrap();
-                return fragment_filenames[0].clone();
+        let batch_size = *NUM_CAT_ONCE.lock().unwrap();
+        if fragment_filenames.len() <= batch_size {
+            // CAT!
+            if USE_NEW_CAT.load(std::sync::atomic::Ordering::Acquire) {
+                catv2(&fragment_filenames).unwrap();
+            } else {
+                catv1(&fragment_filenames).unwrap();
             }
-            n => {
-                let half = n / 2;
-                let left = fragment_filenames[..half].to_vec();
-                let right = fragment_filenames[half..].to_vec();
-                let handle1 = tokio::spawn(async move { reconstruct_async(left).await });
-                let handle2 = tokio::spawn(async move { reconstruct_async(right).await });
 
-                // handle1.await.unwrap();
-                let file1 = match handle1.await {
-                    Ok(filename) => filename,
-                    Err(e) => {
-                        eprintln!("Error {e:?}");
-                        panic!()
-                    }
-                };
-                let file2 = match handle2.await {
-                    Ok(filename) => filename,
-                    Err(e) => {
-                        eprintln!("Error {e:?}");
-                        panic!()
-                    }
-                };
+            fragment_filenames[0].clone()
+        } else {
+            let mut handles = Vec::new();
+            // If chunk_size is larger than NUM_CAT_ONCE, reconstruct_async() goes infinite loop.
+            let chunk_size = std::cmp::min(batch_size, 8);
+            for chunk in fragment_filenames.chunks(chunk_size) {
+                let files = chunk.to_vec();
+                let handle = tokio::spawn(async move { reconstruct_async(files).await });
+                handles.push(handle);
+            }
 
-                let handle3 =
-                    tokio::spawn(async move { reconstruct_async(vec![file1, file2]).await });
-
-                match handle3.await {
-                    Ok(filename) => filename,
+            let mut files = Vec::new();
+            for handle in handles {
+                match handle.await {
+                    Ok(filename) => files.push(filename),
                     Err(e) => {
-                        eprintln!("Error {e:?}");
+                        log::error!("Error {e:?}");
                         panic!();
                     }
+                }
+            }
+
+            let handle = tokio::spawn(async move { reconstruct_async(files).await });
+
+            match handle.await {
+                Ok(filename) => filename,
+                Err(e) => {
+                    log::error!("Error {e:?}");
+                    panic!();
                 }
             }
         }
@@ -208,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for (index, filename) in val.iter().enumerate() {
                 let Some(file_num) = filename.split(".FRAG-").last() else {
-                    panic!("File {filename} does not contain file number.");
+                    panic!("(BUG) File {filename} does not contain file number.");
                 };
                 let number = file_num.parse::<usize>().unwrap_or_default();
 
@@ -230,7 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut joinhandles = Vec::new();
-    // new method
+
     for (key, val) in map.iter() {
         let fragment_filenames = val.clone();
         let handle = tokio::spawn(async move { reconstruct_async(fragment_filenames).await });
@@ -241,7 +314,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for handle in joinhandles {
         match handle.await {
             Ok(filename) => {
-                log::info!("Filename {filename} reconstruction done.");
+                let new_filename = filename.split(".FRAG-").next().unwrap().to_string();
+                log::info!("Filename {new_filename} reconstruction done.");
+                std::fs::rename(filename, new_filename).unwrap();
             }
             Err(e) => {
                 eprintln!("Error {e:?}");
