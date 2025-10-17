@@ -2,55 +2,21 @@ extern crate env_logger;
 extern crate getopts;
 extern crate log;
 
+mod visitdir;
+
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::collections::HashMap;
 use std::env;
-use std::fs::{self, DirEntry};
-use std::io;
+use std::future::Future;
 use std::io::Read;
 use std::io::Write;
-use std::path::Path;
 use std::sync::Mutex;
+
+use visitdir::VisitDir;
 
 const NUM_CAT_ONCE_DEFATLT: usize = 32;
 static NUM_CAT_ONCE: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(NUM_CAT_ONCE_DEFATLT));
-
-struct VisitDir {
-    root: Box<dyn Iterator<Item = io::Result<DirEntry>>>,
-    children: Box<dyn Iterator<Item = VisitDir>>,
-}
-
-impl VisitDir {
-    fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let root = Box::new(fs::read_dir(&path)?);
-        let children = Box::new(fs::read_dir(&path)?.filter_map(|e| {
-            let e = e.ok()?;
-            if e.file_type().ok()?.is_dir() {
-                return VisitDir::new(e.path()).ok();
-            }
-            None
-        }));
-        Ok(VisitDir { root, children })
-    }
-
-    fn entries(self) -> Box<dyn Iterator<Item = io::Result<DirEntry>>> {
-        Box::new(self.root.chain(self.children.flat_map(|s| s.entries())))
-    }
-}
-
-impl Iterator for VisitDir {
-    type Item = io::Result<DirEntry>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(item) = self.root.next() {
-            return Some(item);
-        }
-        if let Some(child) = self.children.next() {
-            self.root = child.entries();
-            return self.next();
-        }
-        None
-    }
-}
 
 fn set_loglevel(loglevel: &str) {
     std::env::set_var("RUST_LOG", loglevel);
@@ -112,6 +78,7 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
 // file1 will be modified.
 // file2.. will be removed.
 fn cat(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    log::trace!("Reconstructing {files:?}");
     if files.len() <= 1 {
         return Ok(());
     }
@@ -143,165 +110,148 @@ fn cat(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct Task {
-    files: Vec<String>,
-    handler: std::thread::JoinHandle<()>,
-}
+/// Find all files to reconstruct.
+/// Group a list of file paths by their base filename (prefix before ".FRAG-").
+///
+/// For example, given "foo.txt.FRAG-001" and "foo.txt.FRAG-002",
+/// both will be grouped under the key "foo.txt".
+fn find_all_files_to_reconstruct2(
+) -> Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error>> {
+    let re = Regex::new(r".FRAG-")?;
+    let file_iter = VisitDir::new(".")?;
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
 
-impl Task {
-    fn new() -> Task {
-        let handler = std::thread::spawn(|| {});
-        Task {
-            files: Vec::new(),
-            handler,
+    for entry in file_iter {
+        let filename = entry?.path().to_string_lossy().into_owned();
+        if !re.is_match(&filename) {
+            continue;
         }
-    }
-}
 
-fn reconstruct(file: &String, fragments: &[String]) {
-    log::info!("Start reconstructing {}", file);
-    let num_cat_once = *NUM_CAT_ONCE.lock().unwrap();
-    let mut fragments = fragments.to_vec();
-    fragments.reverse();
+        let file_key = filename.split(".FRAG-").next().unwrap().to_string();
 
-    // Do leaf tasks.
-    let mut leaf_tasks: Vec<Task> = Vec::new();
-    loop {
-        let mut task = Task::new();
-        for _ in 0..num_cat_once {
-            let f = fragments.pop().unwrap_or_default();
-            task.files.push(f.clone());
-        }
-        let files = task.files.to_vec();
-        if files.first().unwrap().is_empty() {
-            break;
-        }
-        task.handler = std::thread::spawn(move || {
-            loop {
-                match cat(&files) {
-                    Ok(_) => break,
-                    Err(error) => {
-                        log::debug!(
-                            "Error: {}. Retrying in 5 secs. Leader = {}",
-                            error,
-                            files[0]
-                        );
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-                    }
-                }
-            }
-            //cat(&files).unwrap();
-        });
-        leaf_tasks.push(task);
-    }
-
-    // Do sectoin tasks.
-    loop {
-        if leaf_tasks.len() <= 1 {
-            break;
-        }
-        let mut temp_tasks: Vec<Task> = Vec::new();
-        leaf_tasks.reverse();
-
-        loop {
-            let mut task = Task::new();
-            let mut child_tasks: Vec<Task> = Vec::new();
-
-            for _ in 0..num_cat_once {
-                let t = leaf_tasks.pop().unwrap_or_else(Task::new);
-                task.files
-                    .push(t.files.first().unwrap_or(&String::from("")).clone());
-                child_tasks.push(t);
-            }
-            let files = task.files.to_vec();
-            task.handler = std::thread::spawn(move || {
-                for i in child_tasks {
-                    i.handler.join().unwrap();
-                }
-                loop {
-                    match cat(&files) {
-                        Ok(_) => break,
-                        Err(error) => {
-                            log::debug!(
-                                "Error: {}. Retrying in 5 secs. Leader = {}",
-                                error,
-                                files[0]
-                            );
-                            std::thread::sleep(std::time::Duration::from_secs(6));
-                        }
-                    }
-                }
-                //cat(&files).unwrap();
+        map.entry(file_key.clone())
+            .and_modify(|files| files.push(filename.clone()))
+            .or_insert_with(|| {
+                log::debug!("Found file {file_key}");
+                vec![filename]
             });
-            temp_tasks.push(task);
-
-            if leaf_tasks.is_empty() {
-                break;
-            }
-        }
-
-        assert_eq!(leaf_tasks.len(), 0);
-        leaf_tasks.append(&mut temp_tasks);
     }
 
-    let last_task = leaf_tasks.pop().unwrap();
-    assert_eq!(leaf_tasks.len(), 0);
-
-    // Make sure last task has been finished.
-    last_task.handler.join().unwrap();
-
-    // Rename vsi_traverse_-s--l-0.txt.FRAG-00000
-    // e.g. rename vsi_traverse_-s--l-0.txt.FRAG-00000 to vsi_traverse_-s--l-0.txt
-    let long_filename = last_task.files.first().unwrap().clone();
-    let short_filename = file.clone();
-    std::fs::rename(&long_filename, &short_filename).unwrap();
-
-    log::info!("End reconstruction of {}", file);
+    Ok(map)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = String> + Send {
+    async move {
+        match fragment_filenames.len() {
+            0 => unreachable!(),
+            1 => return fragment_filenames[0].clone(),
+            2 => {
+                // cat!
+                cat(&fragment_filenames).unwrap();
+                return fragment_filenames[0].clone();
+            }
+            n => {
+                let half = n / 2;
+                let left = fragment_filenames[..half].to_vec();
+                let right = fragment_filenames[half..].to_vec();
+                let handle1 = tokio::spawn(async move { reconstruct_async(left).await });
+                let handle2 = tokio::spawn(async move { reconstruct_async(right).await });
+
+                // handle1.await.unwrap();
+                let file1 = match handle1.await {
+                    Ok(filename) => filename,
+                    Err(e) => {
+                        eprintln!("Error {e:?}");
+                        panic!()
+                    }
+                };
+                let file2 = match handle2.await {
+                    Ok(filename) => filename,
+                    Err(e) => {
+                        eprintln!("Error {e:?}");
+                        panic!()
+                    }
+                };
+
+                let handle3 =
+                    tokio::spawn(async move { reconstruct_async(vec![file1, file2]).await });
+
+                match handle3.await {
+                    Ok(filename) => filename,
+                    Err(e) => {
+                        eprintln!("Error {e:?}");
+                        panic!();
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let start_time = std::time::Instant::now();
+
     parse_args()?;
     env_logger::init();
 
     log::debug!("NUM_CAT_ONCE = {}", NUM_CAT_ONCE.lock()?);
+    log::debug!("Visiting child dir and finding all files to reconstruct.");
+    let mut map = find_all_files_to_reconstruct2()?;
 
-    let re = Regex::new(r".FRAG-")?;
-    let timer = std::time::Instant::now();
+    // Check that there are no missing numbers.
+    {
+        let mut files_to_skip: Vec<String> = Vec::new();
+        for (key, val) in map.iter_mut() {
+            val.sort_unstable();
+            let mut skip_this_file = false;
 
-    // Find files to reconstruct.
-    let paths = VisitDir::new(".")?
-        .filter_map(|e| Some(e.ok()?.path().to_string_lossy().into_owned()))
-        .filter(|s| re.is_match(s))
-        .collect::<Vec<_>>();
+            for (index, filename) in val.iter().enumerate() {
+                let Some(file_num) = filename.split(".FRAG-").last() else {
+                    panic!("File {filename} does not contain file number.");
+                };
+                let number = file_num.parse::<usize>().unwrap_or_default();
 
-    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for i in paths.iter() {
-        let file: String = i.split(".FRAG-").next().unwrap().to_string();
-        map.entry(file)
-            .and_modify(|files| files.push(i.to_string()))
-            .or_insert_with(|| vec![i.to_string()]);
+                if number != index {
+                    log::warn!("File {key}.FRAG-{index} is missing. Skip reconstructing {key}.");
+                    skip_this_file = true;
+                    files_to_skip.push(key.clone());
+                    break;
+                }
+            }
+
+            if skip_this_file {
+                val.clear();
+            }
+        }
+        for key in files_to_skip {
+            map.remove(&key);
+        }
     }
 
-    let mut join_handler = Vec::new();
-
-    for (key, val) in &mut map {
-        val.sort_unstable();
-        let key_copy = key.clone();
-        let val_copy = val.to_vec();
-        let handler = std::thread::spawn(move || {
-            reconstruct(&key_copy, &val_copy);
-        });
-        join_handler.push(handler);
+    let mut joinhandles = Vec::new();
+    // new method
+    for (key, val) in map.iter() {
+        let fragment_filenames = val.clone();
+        let handle = tokio::spawn(async move { reconstruct_async(fragment_filenames).await });
+        log::info!("Spawned thread for reconstruct {key}");
+        joinhandles.push(handle);
     }
 
-    for i in join_handler {
-        i.join().unwrap();
+    for handle in joinhandles {
+        match handle.await {
+            Ok(filename) => {
+                log::info!("Filename {filename} reconstruction done.");
+            }
+            Err(e) => {
+                eprintln!("Error {e:?}");
+            }
+        }
     }
 
     log::info!(
         "Reconstruction completed. Elapsed {} ms",
-        timer.elapsed().as_millis()
+        start_time.elapsed().as_millis()
     );
     Ok(())
 }
