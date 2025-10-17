@@ -19,7 +19,7 @@ use visitdir::VisitDir;
 const NUM_CAT_ONCE_DEFATLT: usize = 32;
 static NUM_CAT_ONCE: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(NUM_CAT_ONCE_DEFATLT));
 
-static CAT_VARSION: AtomicUsize = AtomicUsize::new(1);
+static CAT_VARSION: AtomicUsize = AtomicUsize::new(2);
 
 fn set_loglevel(loglevel: &str) {
     std::env::set_var("RUST_LOG", loglevel);
@@ -44,8 +44,9 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     opts.optflag("h", "help", "Print this message.");
     opts.optopt("", "log", "One of error, warn, info, debug, trace.", "");
     opts.optflag("v", "verbose", "Same as --log debug.");
-    opts.optflag("", "v2", "Use cat version 2 (Default 1).");
-    opts.optflag("", "v3", "Use cat version 3 (Default 1).");
+    opts.optflag("", "v1", "Use cat version 2 (Default 2).");
+    opts.optflag("", "v2", "Use cat version 2 (Default 2).");
+    opts.optflag("", "v3", "Use cat version 3 (Default 2).");
 
     let matches = opts.parse(&args[1..])?;
 
