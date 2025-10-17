@@ -11,7 +11,7 @@ use std::env;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
 use visitdir::VisitDir;
@@ -19,7 +19,7 @@ use visitdir::VisitDir;
 const NUM_CAT_ONCE_DEFATLT: usize = 32;
 static NUM_CAT_ONCE: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(NUM_CAT_ONCE_DEFATLT));
 
-static USE_NEW_CAT: AtomicBool = AtomicBool::new(false);
+static CAT_VARSION: AtomicUsize = AtomicUsize::new(1);
 
 fn set_loglevel(loglevel: &str) {
     std::env::set_var("RUST_LOG", loglevel);
@@ -44,7 +44,8 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     opts.optflag("h", "help", "Print this message.");
     opts.optopt("", "log", "One of error, warn, info, debug, trace.", "");
     opts.optflag("v", "verbose", "Same as --log debug.");
-    opts.optflag("", "v2", "Use different concatinate functino.");
+    opts.optflag("", "v2", "Use cat version 2 (Default 1).");
+    opts.optflag("", "v3", "Use cat version 3 (Default 1).");
 
     let matches = opts.parse(&args[1..])?;
 
@@ -63,7 +64,9 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if matches.opt_present("v2") {
-        USE_NEW_CAT.store(true, std::sync::atomic::Ordering::Release);
+        CAT_VARSION.store(2, std::sync::atomic::Ordering::Release);
+    } else if matches.opt_present("v3") {
+        CAT_VARSION.store(3, std::sync::atomic::Ordering::Release);
     }
 
     if matches.opt_present("number") {
@@ -82,9 +85,11 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Append the content of file2 to file1.
-// file1 will be modified.
-// file2.. will be removed.
+/// Append the content of file2 to file1.
+/// file1 will be modified.
+/// file2.. will be removed.
+/// Returns String object of file1.
+/// If opening a file fails, sleep a while and retries infinitely.
 fn catv1(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     log::trace!("Reconstructing {files:?}");
     if files.len() <= 1 {
@@ -184,6 +189,80 @@ fn catv2(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Append the content of file2 to file1.
+/// file1 will be modified.
+/// file2.. will be removed.
+/// Returns String object of file1.
+/// If opening a file fails, sleep a while and retries infinitely.
+pub async fn catv3_async(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io;
+    use std::path::Path;
+    use std::time::Duration;
+    use tokio::fs::{remove_file, File, OpenOptions};
+    use tokio::io::{self as tokio_io, AsyncSeekExt, AsyncWriteExt};
+    use tokio::time::sleep;
+
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    async fn open_with_retry(path: &Path, opts: &OpenOptions) -> io::Result<File> {
+        loop {
+            match opts.open(path).await {
+                Ok(f) => return Ok(f),
+                Err(_e) => {
+                    // 固定短時間スリープ後に再試行（無限リトライ）
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    // file1 を開く（追記モード）。存在しなければ作成。
+    let mut wopts = OpenOptions::new();
+    wopts.write(true).create(true).append(true);
+    let mut file1 = open_with_retry(Path::new(&files[0]), &wopts).await?;
+
+    // files[1..] を順に処理
+    for src_path in files.iter().skip(1) {
+        let src_path_p = Path::new(src_path);
+
+        // 読み取りモードで開く（無限リトライ）
+        let mut ropts = OpenOptions::new();
+        ropts.read(true);
+        let mut src = open_with_retry(src_path_p, &ropts).await?;
+
+        // 先頭にシーク（念のため）
+        let _ = src.seek(std::io::SeekFrom::Start(0)).await?;
+
+        // 非同期で copy 相当を実装
+        // tokio::io::copy を使うと File->File の copy が可能（AsyncRead + AsyncWrite）
+        // ただし file1 は append モードで開いているため末尾に書き込まれる。
+        tokio_io::copy(&mut src, &mut file1).await?;
+
+        // 明示的にフラッシュしておく
+        file1.flush().await?;
+
+        // src をクローズ（スコープから外す）
+        drop(src);
+
+        // 削除にリトライ
+        loop {
+            match remove_file(src_path_p).await {
+                Ok(_) => break,
+                Err(_) => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    // 最後に file1 をフラッシュして終了
+    file1.flush().await?;
+
+    Ok(())
+}
+
 /// Find all files to reconstruct.
 /// Group a list of file paths by their base filename (prefix before ".FRAG-").
 ///
@@ -219,11 +298,12 @@ fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = St
     async move {
         let batch_size = *NUM_CAT_ONCE.lock().unwrap();
         if fragment_filenames.len() <= batch_size {
-            // CAT!
-            if USE_NEW_CAT.load(std::sync::atomic::Ordering::Acquire) {
-                catv2(&fragment_filenames).unwrap();
-            } else {
-                catv1(&fragment_filenames).unwrap();
+            // Concatinate!
+            match CAT_VARSION.load(std::sync::atomic::Ordering::Acquire) {
+                1 => catv1(&fragment_filenames).unwrap(),
+                2 => catv2(&fragment_filenames).unwrap(),
+                3 => catv3_async(&fragment_filenames).await.unwrap(),
+                _ => unreachable!("(BUG)"),
             }
 
             fragment_filenames[0].clone()

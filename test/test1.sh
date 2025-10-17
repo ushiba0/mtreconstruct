@@ -19,6 +19,7 @@ cargo fmt
 cargo build
 popd
 
+##### Version 1
 # Create test file.
 dd if=/dev/urandom of=$FILE1 bs=100M count=1
 split -b 1M --numeric-suffixes=0 --suffix-length=5 $FILE1 ${FILE1}_result.FRAG-
@@ -37,5 +38,57 @@ popd
 sha1sum ${FILE1}*
 sha1sum ${DIR1}/*
 
+cleanup
+#####
+
+
+
+
+##### Version 2
+# Create test file.
+dd if=/dev/urandom of=$FILE1 bs=100M count=1
+split -b 1M --numeric-suffixes=0 --suffix-length=5 $FILE1 ${FILE1}_result.FRAG-
+
+# Create test file in child dir.
+mkdir $DIR1
+pushd $DIR1
+cp ../${FILE1}* .
+popd
+
+
+## Reconstruct
+../target/debug/mtreconstruct --log debug --v2
+
+## Checksum
+sha1sum ${FILE1}*
+sha1sum ${DIR1}/*
 
 cleanup
+#####
+
+
+
+
+##### Version 3
+# Create test file.
+dd if=/dev/urandom of=$FILE1 bs=100M count=1
+split -b 1M --numeric-suffixes=0 --suffix-length=5 $FILE1 ${FILE1}_result.FRAG-
+
+# Create test file in child dir.
+mkdir $DIR1
+pushd $DIR1
+cp ../${FILE1}* .
+popd
+
+
+## Reconstruct
+../target/debug/mtreconstruct --log debug --v3
+
+## Checksum
+sha1sum ${FILE1}*
+sha1sum ${DIR1}/*
+
+cleanup
+#####
+
+
