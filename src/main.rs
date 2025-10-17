@@ -44,7 +44,7 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     opts.optflag("h", "help", "Print this message.");
     opts.optopt("", "log", "One of error, warn, info, debug, trace.", "");
     opts.optflag("v", "verbose", "Same as --log debug.");
-    opts.optflag("", "v1", "Use cat version 2 (Default 2).");
+    opts.optflag("", "v1", "Use cat version 1 (Default 2).");
     opts.optflag("", "v2", "Use cat version 2 (Default 2).");
     opts.optflag("", "v3", "Use cat version 3 (Default 2).");
 
