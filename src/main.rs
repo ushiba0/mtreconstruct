@@ -4,7 +4,6 @@ extern crate log;
 
 mod visitdir;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashMap;
 use std::env;
@@ -12,13 +11,11 @@ use std::future::Future;
 use std::io::Read;
 use std::io::Write;
 use std::sync::atomic::AtomicUsize;
-use std::sync::Mutex;
-
+use std::sync::atomic::Ordering;
 use visitdir::VisitDir;
 
-const NUM_CAT_ONCE_DEFATLT: usize = 32;
-static NUM_CAT_ONCE: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(NUM_CAT_ONCE_DEFATLT));
-
+const BATCH_SIZE_DEFAULT: usize = 32;
+static BATCH_SIZE: AtomicUsize = AtomicUsize::new(BATCH_SIZE_DEFAULT);
 static CAT_VARSION: AtomicUsize = AtomicUsize::new(2);
 
 fn set_loglevel(loglevel: &str) {
@@ -40,7 +37,7 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     let program = args[0].clone();
     let mut opts = getopts::Options::new();
 
-    opts.optopt("n", "number", "number", "");
+    opts.optopt("b", "batch-size", &format!("(Default {BATCH_SIZE_DEFAULT}) Maximum number of files that can be concatenated simultaneously. In other words, with -b 2, the command `cat file.log.FRAG-00001 file.log.FRAG-00002` will be executed."), "");
     opts.optflag("h", "help", "Print this message.");
     opts.optopt("", "log", "One of error, warn, info, debug, trace.", "");
     opts.optflag("v", "verbose", "Same as --log debug.");
@@ -65,22 +62,21 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if matches.opt_present("v2") {
-        CAT_VARSION.store(2, std::sync::atomic::Ordering::Release);
+        CAT_VARSION.store(2, Ordering::Release);
     } else if matches.opt_present("v3") {
-        CAT_VARSION.store(3, std::sync::atomic::Ordering::Release);
+        CAT_VARSION.store(3, Ordering::Release);
     }
 
-    if matches.opt_present("number") {
+    if matches.opt_present("batch-size") {
         let number_arg = matches
-            .opt_str("number")
-            .unwrap_or(format!("{}", NUM_CAT_ONCE_DEFATLT));
-        let number: usize = number_arg.parse()?;
-        if !(2..=100).contains(&number) {
-            let number_error = std::io::Error::new(std::io::ErrorKind::Other, "Input number error");
-            return Err(Box::new(number_error));
+            .opt_str("batch-size")
+            .unwrap_or(format!("{}", BATCH_SIZE_DEFAULT));
+        let batch_size: usize = number_arg.parse()?;
+        if !(2..=1000).contains(&batch_size) {
+            return Err("Invalid batch size.".into());
         }
-        assert!(number > 1);
-        *NUM_CAT_ONCE.lock()? = number;
+        assert!(batch_size >= 2);
+        BATCH_SIZE.store(batch_size, Ordering::Release);
     }
 
     Ok(())
@@ -297,10 +293,10 @@ fn find_all_files_to_reconstruct2(
 fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = String> + Send {
     log::trace!("[reconstruct_async] {fragment_filenames:?}");
     async move {
-        let batch_size = *NUM_CAT_ONCE.lock().unwrap();
+        let batch_size = BATCH_SIZE.load(Ordering::Acquire);
         if fragment_filenames.len() <= batch_size {
             // Concatinate!
-            match CAT_VARSION.load(std::sync::atomic::Ordering::Acquire) {
+            match CAT_VARSION.load(Ordering::Acquire) {
                 1 => catv1(&fragment_filenames).unwrap(),
                 2 => catv2(&fragment_filenames).unwrap(),
                 3 => catv3_async(&fragment_filenames).await.unwrap(),
@@ -349,7 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     parse_args()?;
     env_logger::init();
 
-    log::debug!("NUM_CAT_ONCE = {}", NUM_CAT_ONCE.lock()?);
+    log::debug!("batch_size = {}", BATCH_SIZE.load(Ordering::Acquire));
     log::debug!("Visiting child dir and finding all files to reconstruct.");
     let mut map = find_all_files_to_reconstruct2()?;
 
