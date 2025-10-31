@@ -10,6 +10,7 @@ use std::env;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use visitdir::VisitDir;
@@ -17,6 +18,7 @@ use visitdir::VisitDir;
 const BATCH_SIZE_DEFAULT: usize = 32;
 static BATCH_SIZE: AtomicUsize = AtomicUsize::new(BATCH_SIZE_DEFAULT);
 static CAT_VARSION: AtomicUsize = AtomicUsize::new(2);
+static FORCE_RECONSTRUCT: AtomicBool = AtomicBool::new(false);
 
 fn set_loglevel(loglevel: &str) {
     std::env::set_var("RUST_LOG", loglevel);
@@ -37,13 +39,14 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     let program = args[0].clone();
     let mut opts = getopts::Options::new();
 
-    opts.optopt("b", "batch-size", &format!("(Default {BATCH_SIZE_DEFAULT}) Maximum number of files that can be concatenated simultaneously. In other words, with -b 2, the command `cat file.log.FRAG-00001 file.log.FRAG-00002` will be executed."), "");
     opts.optflag("h", "help", "Print this message.");
     opts.optopt("", "log", "One of error, warn, info, debug, trace.", "");
     opts.optflag("v", "verbose", "Same as --log debug.");
-    opts.optflag("", "v1", "Use cat version 1 (Default 2).");
-    opts.optflag("", "v2", "Use cat version 2 (Default 2).");
-    opts.optflag("", "v3", "Use cat version 3 (Default 2).");
+    opts.optflag("1", "v1", "Use cat version 1 (Default 2).");
+    opts.optflag("2", "v2", "Use cat version 2 (Default 2).");
+    opts.optflag("3", "v3", "Use cat version 3 (Default 2).");
+    opts.optopt("b", "batch-size", &format!("(Default {BATCH_SIZE_DEFAULT}) Maximum number of files that can be concatenated simultaneously. In other words, with -b 2, the command `cat file.log.FRAG-00001 file.log.FRAG-00002` will be executed."), "");
+    opts.optflag("f", "force", "The file suffixes are expected to be .FRAG-00000, .FRAG-00001, .FRAG-00002, and so on. By default, if the files do not match this pattern, reconstruction is skipped. The --force option bypasses this verification and forcibly concatenates the files.");
 
     let matches = opts.parse(&args[1..])?;
 
@@ -77,6 +80,10 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
         }
         assert!(batch_size >= 2);
         BATCH_SIZE.store(batch_size, Ordering::Release);
+    }
+
+    if matches.opt_present("f") {
+        FORCE_RECONSTRUCT.store(true, Ordering::Release);
     }
 
     Ok(())
@@ -338,6 +345,40 @@ fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = St
     }
 }
 
+/// Check whether the fragment numbers are consecutive.
+/// Example:
+///     If .FRAG-00001 is missing, as in .FRAG-00000, .FRAG-00002, .FRAG-00003, ..., remove the key from file_map.
+fn verify_file_number(file_map: &mut HashMap<String, Vec<String>>) {
+    let mut files_to_skip: Vec<String> = Vec::new();
+
+    for (key, val) in file_map.iter() {
+        for (index, filename) in val.iter().enumerate() {
+            let Some(file_num) = filename.split(".FRAG-").last() else {
+                panic!("(BUG) File {filename} does not contain file number.");
+            };
+            let number = file_num.parse::<usize>().unwrap_or_default();
+
+            if number != index {
+                if FORCE_RECONSTRUCT.load(Ordering::Acquire) {
+                    log::warn!(
+                        "File {key}.FRAG-{index:>05} is missing, but continue reconstruction."
+                    );
+                    break;
+                } else {
+                    log::warn!(
+                        "File {key}.FRAG-{index:>05} is missing. Skip reconstruction of {key}."
+                    );
+                    files_to_skip.push(key.clone());
+                    break;
+                }
+            }
+        }
+    }
+    for key in files_to_skip {
+        file_map.remove(&key);
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = std::time::Instant::now();
@@ -349,35 +390,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::debug!("Visiting child dir and finding all files to reconstruct.");
     let mut map = find_all_files_to_reconstruct2()?;
 
-    // Check that there are no missing numbers.
-    {
-        let mut files_to_skip: Vec<String> = Vec::new();
-        for (key, val) in map.iter_mut() {
-            val.sort_unstable();
-            let mut skip_this_file = false;
-
-            for (index, filename) in val.iter().enumerate() {
-                let Some(file_num) = filename.split(".FRAG-").last() else {
-                    panic!("(BUG) File {filename} does not contain file number.");
-                };
-                let number = file_num.parse::<usize>().unwrap_or_default();
-
-                if number != index {
-                    log::warn!("File {key}.FRAG-{index} is missing. Skip reconstructing {key}.");
-                    skip_this_file = true;
-                    files_to_skip.push(key.clone());
-                    break;
-                }
-            }
-
-            if skip_this_file {
-                val.clear();
-            }
-        }
-        for key in files_to_skip {
-            map.remove(&key);
-        }
+    for (_, val) in map.iter_mut() {
+        val.sort_unstable();
     }
+
+    verify_file_number(&mut map);
 
     let mut joinhandles = Vec::new();
 
