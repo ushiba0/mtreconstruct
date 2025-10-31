@@ -71,9 +71,7 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if matches.opt_present("batch-size") {
-        let number_arg = matches
-            .opt_str("batch-size")
-            .unwrap_or(format!("{}", BATCH_SIZE_DEFAULT));
+        let number_arg = matches.opt_str("batch-size").unwrap_or(format!("{}", BATCH_SIZE_DEFAULT));
         let batch_size: usize = number_arg.parse()?;
         if !(2..=1000).contains(&batch_size) {
             return Err("Invalid batch size.".into());
@@ -130,7 +128,7 @@ fn catv1(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 /// file2.. will be removed.
 /// Returns String object of file1.
 /// If opening a file fails, sleep a while and retries infinitely.
-fn catv2(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn catv2(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use std::fs::{remove_file, File, OpenOptions};
     use std::io::{self, Seek, SeekFrom, Write};
     use std::thread::sleep;
@@ -198,7 +196,7 @@ fn catv2(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 /// file2.. will be removed.
 /// Returns String object of file1.
 /// If opening a file fails, sleep a while and retries infinitely.
-pub async fn catv3_async(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn catv3_async(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use std::io;
     use std::path::Path;
     use std::time::Duration;
@@ -272,8 +270,7 @@ pub async fn catv3_async(files: &Vec<String>) -> Result<(), Box<dyn std::error::
 ///
 /// For example, given "foo.txt.FRAG-001" and "foo.txt.FRAG-002",
 /// both will be grouped under the key "foo.txt".
-fn find_all_files_to_reconstruct2(
-) -> Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error>> {
+fn find_all_files_to_reconstruct2() -> Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error>> {
     let re = Regex::new(r".FRAG-")?;
     let file_iter = VisitDir::new(".")?;
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
@@ -360,14 +357,11 @@ fn verify_file_number(file_map: &mut HashMap<String, Vec<String>>) {
 
             if number != index {
                 if FORCE_RECONSTRUCT.load(Ordering::Acquire) {
-                    log::warn!(
-                        "File {key}.FRAG-{index:>05} is missing, but continue reconstruction."
-                    );
+                    log::warn!("File {key}.FRAG-{index:>05} is missing, but continue reconstruction.");
                     break;
                 } else {
-                    log::warn!(
-                        "File {key}.FRAG-{index:>05} is missing. Skip reconstruction of {key}."
-                    );
+                    log::warn!("File {key}.FRAG-{index:>05} is missing. Skip reconstruction of {key}.");
+                    log::warn!("[HINT] Try --force option.");
                     files_to_skip.push(key.clone());
                     break;
                 }
@@ -418,9 +412,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    log::info!(
-        "Reconstruction completed. Elapsed {} ms",
-        start_time.elapsed().as_millis()
-    );
+    log::info!("Reconstruction completed. Elapsed {} ms", start_time.elapsed().as_millis());
     Ok(())
 }
