@@ -15,7 +15,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use visitdir::VisitDir;
 
-const BATCH_SIZE_DEFAULT: usize = 32;
+const BATCH_SIZE_DEFAULT: usize = 100000;
 static BATCH_SIZE: AtomicUsize = AtomicUsize::new(BATCH_SIZE_DEFAULT);
 static CAT_VARSION: AtomicUsize = AtomicUsize::new(2);
 static FORCE_RECONSTRUCT: AtomicBool = AtomicBool::new(false);
@@ -24,7 +24,7 @@ fn set_loglevel(loglevel: &str) {
     std::env::set_var("RUST_LOG", loglevel);
 }
 
-fn print_usage(program: &str, opts: &getopts::Options) {
+fn print_usage(program: &str, opts: &getopts::Options) -> ! {
     let brief = format!(
         "Multithread reconstruction.
 Usage: {program}
@@ -52,7 +52,6 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
 
     if matches.opt_present("h") {
         print_usage(&program, &opts);
-        unreachable!();
     }
 
     if matches.opt_present("log") {
@@ -73,7 +72,7 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     if matches.opt_present("batch-size") {
         let number_arg = matches.opt_str("batch-size").unwrap_or(format!("{}", BATCH_SIZE_DEFAULT));
         let batch_size: usize = number_arg.parse()?;
-        if !(2..=1000).contains(&batch_size) {
+        if !(2..).contains(&batch_size) {
             return Err("Invalid batch size.".into());
         }
         assert!(batch_size >= 2);
@@ -129,63 +128,62 @@ fn catv1(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 /// Returns String object of file1.
 /// If opening a file fails, sleep a while and retries infinitely.
 fn catv2(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use std::fs::{remove_file, File, OpenOptions};
-    use std::io::{self, Seek, SeekFrom, Write};
-    use std::thread::sleep;
-    use std::time::Duration;
+    use std::io::{Seek, SeekFrom};
 
-    fn open_with_retry(path: &str, options: &OpenOptions) -> io::Result<File> {
-        loop {
-            match options.open(path) {
-                Ok(f) => return Ok(f),
+    fn open_with_retry(path: &str, retry: usize, dur_ms: u64, opts: &std::fs::OpenOptions) -> std::fs::File {
+        for _ in 0..retry {
+            match opts.open(path) {
+                Ok(f) => return f,
                 Err(e) => {
-                    // 簡単なバックオフ（固定）
-                    sleep(Duration::from_millis(100));
-                    // ループして再試行（無限リトライ）
-                    let _ = e; // エラーを破棄（必要ならログへ出力）
+                    log::warn!("File {path} open failed. {e:?} Retry in {dur_ms} ms.");
+                    let duration = std::time::Duration::from_millis(dur_ms);
+                    std::thread::sleep(duration);
                 }
             }
         }
+        panic!("File {path} open failed after {retry} retries.");
     }
 
-    if files.is_empty() {
+    fn delete_with_retry(path: &str, retry: usize, dur_ms: u64) {
+        for _ in 0..retry {
+            match std::fs::remove_file(path) {
+                Ok(_) => return,
+                Err(e) => {
+                    log::warn!("File {path} remove failed. {e:?} Retry in {dur_ms} ms.");
+                    let duration = std::time::Duration::from_millis(dur_ms);
+                    std::thread::sleep(duration);
+                }
+            }
+        }
+        panic!("File {path} remove failed after {retry} retries.");
+    }
+
+    if files.len() <= 1 {
         return Ok(());
     }
 
-    // file1 を開く（追記モード）。存在しなければ作成。
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true).append(true);
-    let mut file1 = open_with_retry(&files[0], &opts)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(false).append(true);
+    let mut file1 = open_with_retry(&files[0], 10, 1000, &opts);
 
-    // file2.. を順に開いて内容を file1 にコピーし、その後削除
+    // Open files[1], files[2], ... and append them to files[0].
     for src_path in files.iter().skip(1) {
-        // 読み取りモードで開く（無限リトライ）
-        let mut ropts = OpenOptions::new();
+        // Open file.
+        let mut ropts = std::fs::OpenOptions::new();
         ropts.read(true);
-        let mut src = open_with_retry(src_path, &ropts)?;
+        let mut src = open_with_retry(src_path, 10, 1000, &ropts);
 
-        // copy を行うために、src の先頭へシーク（念のため）
+        // Seek to start (念のため).
         let _ = src.seek(SeekFrom::Start(0));
 
-        // std::io::copy を使用して src -> file1
-        // 注意: append モードの file1 は内部的に末尾へ書き込まれるが、
-        // 複数ファイルを順にコピーするので問題ない。
-        io::copy(&mut src, &mut file1)?;
+        // Append src file to file1.
+        std::io::copy(&mut src, &mut file1)?;
 
-        // コピー完了後、src ファイルを閉じて削除
+        // Remove src file.
         drop(src);
-        // 削除にもリトライをかける（簡易実装）
-        loop {
-            match remove_file(src_path) {
-                Ok(_) => break,
-                Err(_) => {
-                    sleep(Duration::from_millis(100));
-                }
-            }
-        }
+        delete_with_retry(&src_path, 10, 1000);
     }
 
-    // 変更をフラッシュ
     file1.flush()?;
 
     Ok(())
@@ -197,66 +195,60 @@ fn catv2(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// Returns String object of file1.
 /// If opening a file fails, sleep a while and retries infinitely.
 pub async fn catv3_async(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io;
-    use std::path::Path;
-    use std::time::Duration;
-    use tokio::fs::{remove_file, File, OpenOptions};
-    use tokio::io::{self as tokio_io, AsyncSeekExt, AsyncWriteExt};
-    use tokio::time::sleep;
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-    if files.is_empty() {
+    if files.len() <= 1 {
         return Ok(());
     }
 
-    async fn open_with_retry(path: &Path, opts: &OpenOptions) -> io::Result<File> {
-        loop {
+    async fn open_with_retry(path: &str, retry: usize, dur_ms: u64, opts: &tokio::fs::OpenOptions) -> tokio::fs::File {
+        for _ in 0..retry {
             match opts.open(path).await {
-                Ok(f) => return Ok(f),
-                Err(_e) => {
-                    // 固定短時間スリープ後に再試行（無限リトライ）
-                    sleep(Duration::from_millis(100)).await;
+                Ok(f) => return f,
+                Err(e) => {
+                    log::warn!("File {path} open failed. {e:?} Retry in {dur_ms} ms.");
+                    let duration = tokio::time::Duration::from_millis(dur_ms);
+                    tokio::time::sleep(duration).await;
                 }
             }
         }
+        panic!("File {path} open failed after {retry} retries.");
     }
 
-    // file1 を開く（追記モード）。存在しなければ作成。
-    let mut wopts = OpenOptions::new();
-    wopts.write(true).create(true).append(true);
-    let mut file1 = open_with_retry(Path::new(&files[0]), &wopts).await?;
-
-    // files[1..] を順に処理
-    for src_path in files.iter().skip(1) {
-        let src_path_p = Path::new(src_path);
-
-        // 読み取りモードで開く（無限リトライ）
-        let mut ropts = OpenOptions::new();
-        ropts.read(true);
-        let mut src = open_with_retry(src_path_p, &ropts).await?;
-
-        // 先頭にシーク（念のため）
-        let _ = src.seek(std::io::SeekFrom::Start(0)).await?;
-
-        // 非同期で copy 相当を実装
-        // tokio::io::copy を使うと File->File の copy が可能（AsyncRead + AsyncWrite）
-        // ただし file1 は append モードで開いているため末尾に書き込まれる。
-        tokio_io::copy(&mut src, &mut file1).await?;
-
-        // 明示的にフラッシュしておく
-        file1.flush().await?;
-
-        // src をクローズ（スコープから外す）
-        drop(src);
-
-        // 削除にリトライ
-        loop {
-            match remove_file(src_path_p).await {
-                Ok(_) => break,
-                Err(_) => {
-                    sleep(Duration::from_millis(100)).await;
+    async fn delete_with_retry(path: &str, retry: usize, dur_ms: u64) {
+        for _ in 0..retry {
+            match tokio::fs::remove_file(path).await {
+                Ok(_) => return,
+                Err(e) => {
+                    log::warn!("File {path} remove failed. {e:?} Retry in {dur_ms} ms.");
+                    let duration = tokio::time::Duration::from_millis(dur_ms);
+                    tokio::time::sleep(duration).await;
                 }
             }
         }
+        panic!("File {path} remove failed after {retry} retries.");
+    }
+
+    let mut wopts = tokio::fs::OpenOptions::new();
+    wopts.write(true).create(false).append(true);
+    let mut file1 = open_with_retry(&files[0], 10, 1000, &wopts).await;
+
+    // Open files[1], files[2], ... and append them to files[0].
+    for src_path in files.iter().skip(1) {
+        // Open file.
+        let mut ropts = tokio::fs::OpenOptions::new();
+        ropts.read(true);
+        let mut src = open_with_retry(&src_path, 10, 1000, &ropts).await;
+
+        // Seek to start (念のため).
+        let _ = src.seek(std::io::SeekFrom::Start(0)).await?;
+
+        // Append src file to file1.
+        tokio::io::copy(&mut src, &mut file1).await?;
+
+        // Remove src file.
+        drop(src);
+        delete_with_retry(&src_path, 10, 1000).await;
     }
 
     // 最後に file1 をフラッシュして終了
@@ -294,6 +286,8 @@ fn find_all_files_to_reconstruct2() -> Result<HashMap<String, Vec<String>>, Box<
     Ok(map)
 }
 
+// Concatinates files.
+// Returns filename.
 fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = String> + Send {
     log::trace!("[reconstruct_async] {fragment_filenames:?}");
     async move {
@@ -310,9 +304,7 @@ fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = St
             fragment_filenames[0].clone()
         } else {
             let mut handles = Vec::new();
-            // If chunk_size is larger than NUM_CAT_ONCE, reconstruct_async() goes infinite loop.
-            let chunk_size = std::cmp::min(batch_size, 8);
-            for chunk in fragment_filenames.chunks(chunk_size) {
+            for chunk in fragment_filenames.chunks(batch_size) {
                 let files = chunk.to_vec();
                 let handle = tokio::spawn(async move { reconstruct_async(files).await });
                 handles.push(handle);
@@ -394,18 +386,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (key, val) in map.iter() {
         let fragment_filenames = val.clone();
-        let handle = tokio::spawn(async move { reconstruct_async(fragment_filenames).await });
+        let filename = key.clone();
+        let handle = tokio::spawn(async move {
+            let thread_start_time = std::time::Instant::now();
+            let res = reconstruct_async(fragment_filenames).await;
+            let elapsed = thread_start_time.elapsed().as_millis();
+            log::info!("Reconstruction of {filename} completed. Elapsed {elapsed} ms.");
+
+            // Rename file.
+            match tokio::fs::rename(&res, &filename).await {
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("Failed to rename {res} to {filename}. {e:?}")
+                }
+            }
+            res
+        });
         log::info!("Spawned thread for reconstruct {key}");
         joinhandles.push(handle);
     }
 
     for handle in joinhandles {
         match handle.await {
-            Ok(filename) => {
-                let new_filename = filename.split(".FRAG-").next().unwrap().to_string();
-                log::info!("Filename {new_filename} reconstruction done.");
-                std::fs::rename(filename, new_filename).unwrap();
-            }
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("Error {e:?}");
             }
