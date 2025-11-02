@@ -50,30 +50,28 @@ cargo build
 popd
 ##### 
 
-##### Test for cat version 1
-prepare_test_file
-time ../target/debug/mtreconstruct --v1 "$COMMON_RECONSTRUCT_OPTS"
-checksum
-cleanup
-echo Test 1 Ok.
+
+##### Test for cat (std::io::copy())
+time ../target/debug/mtreconstruct -v --help
+echo Test "--help" Ok.
 #####
 
 
-##### Test for cat version 2
+##### Test for cat (std::io::copy())
 prepare_test_file
-time ../target/debug/mtreconstruct --v2 "$COMMON_RECONSTRUCT_OPTS"
+time ../target/debug/mtreconstruct -v
 checksum
 cleanup
-echo Test 2 Ok.
+echo Test "Reconstruction default" Ok.
 #####
 
 
-##### Test for cat version 3
+##### Test for cat (tokio::io::copy())
 prepare_test_file
-time ../target/debug/mtreconstruct --v3 "$COMMON_RECONSTRUCT_OPTS"
+time ../target/debug/mtreconstruct -v --async
 checksum
 cleanup
-echo Test 3 Ok.
+echo Test "Reconstruction async" Ok.
 #####
 
 

@@ -8,16 +8,16 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::env;
 use std::future::Future;
-use std::io::Read;
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use visitdir::VisitDir;
 
+// Constants and command line options.
 const BATCH_SIZE_DEFAULT: usize = 100000;
 static BATCH_SIZE: AtomicUsize = AtomicUsize::new(BATCH_SIZE_DEFAULT);
-static CAT_VARSION: AtomicUsize = AtomicUsize::new(2);
+static CAT_ASYNC: AtomicBool = AtomicBool::new(false);
 static FORCE_RECONSTRUCT: AtomicBool = AtomicBool::new(false);
 
 fn set_loglevel(loglevel: &str) {
@@ -42,11 +42,29 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     opts.optflag("h", "help", "Print this message.");
     opts.optopt("", "log", "One of error, warn, info, debug, trace.", "");
     opts.optflag("v", "verbose", "Same as --log debug.");
-    opts.optflag("1", "v1", "Use cat version 1 (Default 2).");
-    opts.optflag("2", "v2", "Use cat version 2 (Default 2).");
-    opts.optflag("3", "v3", "Use cat version 3 (Default 2).");
-    opts.optopt("b", "batch-size", &format!("(Default {BATCH_SIZE_DEFAULT}) Maximum number of files that can be concatenated simultaneously. In other words, with -b 2, the command `cat file.log.FRAG-00001 file.log.FRAG-00002` will be executed."), "");
-    opts.optflag("f", "force", "The file suffixes are expected to be .FRAG-00000, .FRAG-00001, .FRAG-00002, and so on. By default, if the files do not match this pattern, reconstruction is skipped. The --force option bypasses this verification and forcibly concatenates the files.");
+    opts.optflag(
+        "a",
+        "async",
+        "Use tokio::io::copy() instad of std::io::copy(). \
+        (May be slower than default.)",
+    );
+    opts.optopt(
+        "b",
+        "batch-size",
+        &format!(
+            "(Default {BATCH_SIZE_DEFAULT}) Maximum \
+            number of files that can be concatenated simultaneously."
+        ),
+        "",
+    );
+    opts.optflag(
+        "f",
+        "force",
+        "The file suffixes are expected to be .FRAG-00000, \
+            .FRAG-00001, .FRAG-00002, and so on. By default, if the files do not match this pattern, \
+            reconstruction is skipped. The --force option bypasses this verification and forcibly \
+            concatenates the files.",
+    );
 
     let matches = opts.parse(&args[1..])?;
 
@@ -63,10 +81,10 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
         set_loglevel("debug");
     }
 
-    if matches.opt_present("v2") {
-        CAT_VARSION.store(2, Ordering::Release);
-    } else if matches.opt_present("v3") {
-        CAT_VARSION.store(3, Ordering::Release);
+    if matches.opt_present("async") {
+        CAT_ASYNC.store(true, Ordering::Release);
+    } else {
+        CAT_ASYNC.store(false, Ordering::Release);
     }
 
     if matches.opt_present("batch-size") {
@@ -119,43 +137,7 @@ async fn open_with_retry_async(path: &str, retry: usize, dur_ms: u64, opts: &tok
 /// file2.. will be removed.
 /// Returns String object of file1.
 /// If opening a file fails, sleep a while and retries infinitely.
-fn catv1(files: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    log::trace!("Reconstructing {files:?}");
-    if files.len() <= 1 {
-        return Ok(());
-    }
-    for file in files.iter() {
-        if file.is_empty() {
-            panic!("(BUG) Filename is empty.");
-        }
-    }
-
-    let f1 = std::fs::OpenOptions::new().append(true).open(&files[0])?;
-    let mut buf1 = std::io::BufWriter::new(f1);
-
-    for file in files.iter().skip(1) {
-        if file.is_empty() {
-            continue;
-        }
-
-        let f2 = std::fs::File::open(file)?;
-        let mut buf2 = std::io::BufReader::new(f2);
-
-        let mut b: Vec<u8> = Vec::new();
-        buf2.read_to_end(&mut b)?;
-        buf1.write_all(&b)?;
-        std::fs::remove_file(file)?;
-    }
-
-    Ok(())
-}
-
-/// Append the content of file2 to file1.
-/// file1 will be modified.
-/// file2.. will be removed.
-/// Returns String object of file1.
-/// If opening a file fails, sleep a while and retries infinitely.
-async fn catv2(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+async fn concatinate(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{Seek, SeekFrom};
 
     if files.len() <= 1 {
@@ -194,7 +176,7 @@ async fn catv2(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// file2.. will be removed.
 /// Returns String object of file1.
 /// If opening a file fails, sleep a while and retries infinitely.
-pub async fn catv3_async(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn concatinate_async(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
     if files.len() <= 1 {
@@ -233,7 +215,7 @@ pub async fn catv3_async(files: &[String]) -> Result<(), Box<dyn std::error::Err
 ///
 /// For example, given "foo.txt.FRAG-001" and "foo.txt.FRAG-002",
 /// both will be grouped under the key "foo.txt".
-fn find_all_files_to_reconstruct2() -> Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error>> {
+fn find_all_files_to_reconstruct() -> Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error>> {
     let re = Regex::new(r".FRAG-")?;
     let file_iter = VisitDir::new(".")?;
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
@@ -265,13 +247,18 @@ fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = St
         let batch_size = BATCH_SIZE.load(Ordering::Acquire);
         if fragment_filenames.len() <= batch_size {
             // Concatinate!
-            match CAT_VARSION.load(Ordering::Acquire) {
-                1 => catv1(&fragment_filenames).unwrap(),
-                2 => catv2(&fragment_filenames).await.unwrap(),
-                3 => catv3_async(&fragment_filenames).await.unwrap(),
-                _ => unreachable!("(BUG)"),
+            let res = if CAT_ASYNC.load(Ordering::Acquire) {
+                concatinate_async(&fragment_filenames).await
+            } else {
+                concatinate(&fragment_filenames).await
+            };
+            match res {
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!("Error while concatinate files {}.. {e:?}", fragment_filenames[0]);
+                    panic!();
+                }
             }
-
             fragment_filenames[0].clone()
         } else {
             let mut handles = Vec::new();
@@ -344,8 +331,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     log::debug!("batch_size = {}", BATCH_SIZE.load(Ordering::Acquire));
+    if CAT_ASYNC.load(Ordering::Acquire) {
+        log::info!("Using tokio::io::copy().");
+    }
     log::debug!("Visiting child dir and finding all files to reconstruct.");
-    let mut map = find_all_files_to_reconstruct2()?;
+    let mut map = find_all_files_to_reconstruct()?;
 
     for (_, val) in map.iter_mut() {
         val.sort_unstable();
@@ -364,7 +354,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let file_num = fragment_filenames.len();
             let res = reconstruct_async(fragment_filenames).await;
             let elapsed = thread_start_time.elapsed().as_millis();
-            log::info!("Reconstruction of {filename} completed. Total {file_num} files. Elapsed {elapsed} ms.");
+            let meta = tokio::fs::metadata(&res).await.unwrap();
+            let size_mb = meta.len() / 1024 / 1024;
+            log::info!(
+                "Reconstruction of {filename} completed. Total files = {file_num}, Size = {size_mb} Mib, Elapsed = {elapsed} ms."
+            );
 
             // Rename file.
             match tokio::fs::rename(&res, &filename).await {
