@@ -4,7 +4,7 @@ set -e
 
 FILE1="bigfile.bin"
 DIR1="dir1"
-COMMON_RECONSTRUCT_OPTS="-v"
+COMMON_RECONSTRUCT_OPTS="-v -b 10"
 
 cleanup() {
   ## Clean up
@@ -46,20 +46,20 @@ cleanup
 ##### Build mtreconstruct.
 pushd ..
 cargo fmt
-cargo build
+cargo build --release
 popd
 ##### 
 
 
-##### Test for cat (std::io::copy())
-time ../target/debug/mtreconstruct -v --help
+##### Test for --help
+time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS --help
 echo Test "--help" Ok.
 #####
 
 
 ##### Test for cat (std::io::copy())
 prepare_test_file
-time ../target/debug/mtreconstruct -v
+time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS
 checksum
 cleanup
 echo Test "Reconstruction default" Ok.
@@ -68,7 +68,7 @@ echo Test "Reconstruction default" Ok.
 
 ##### Test for cat (tokio::io::copy())
 prepare_test_file
-time ../target/debug/mtreconstruct -v --async
+time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS --async
 checksum
 cleanup
 echo Test "Reconstruction async" Ok.
