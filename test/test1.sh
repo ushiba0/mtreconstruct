@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-
+SCRIPT_DIR=$(dirname "${BASH_SOURCE:-0}")
 FILE1="bigfile.bin"
 DIR1="dir1"
 COMMON_RECONSTRUCT_OPTS="-v -b 10"
@@ -34,44 +34,50 @@ checksum() {
 
 prepare_test_file() {
   dd if=/dev/urandom of=$FILE1 bs=101M count=1 2> /dev/null > /dev/null
-  split -b 1M --numeric-suffixes=0 --suffix-length=5 $FILE1 ${FILE1}_result.FRAG- 2> /dev/null > /dev/null
+  split -b 100k --numeric-suffixes=0 --suffix-length=5 $FILE1 ${FILE1}_result.FRAG- 2> /dev/null > /dev/null
   mkdir $DIR1
   pushd $DIR1
   cp ../${FILE1}* .
   popd
 }
 
-cleanup
+main() {
+  cleanup
 
-##### Build mtreconstruct.
-pushd ..
-cargo fmt
-cargo build --release
+  ##### Build mtreconstruct.
+  pushd ..
+  cargo fmt
+  cargo build --release
+  popd
+  ##### 
+
+
+  ##### Test for --help
+  time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS --help
+  echo Test "--help" Ok.
+  #####
+
+
+  ##### Test for cat (std::io::copy())
+  prepare_test_file
+  time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS
+  checksum
+  cleanup
+  echo Test "Reconstruction default" Ok.
+  #####
+
+
+  ##### Test for cat (tokio::io::copy())
+  prepare_test_file
+  time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS --async
+  checksum
+  cleanup
+  echo Test "Reconstruction async" Ok.
+  #####
+}
+
+##### main
+pushd "$SCRIPT_DIR"
+main
 popd
-##### 
-
-
-##### Test for --help
-time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS --help
-echo Test "--help" Ok.
-#####
-
-
-##### Test for cat (std::io::copy())
-prepare_test_file
-time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS
-checksum
-cleanup
-echo Test "Reconstruction default" Ok.
-#####
-
-
-##### Test for cat (tokio::io::copy())
-prepare_test_file
-time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS --async
-checksum
-cleanup
-echo Test "Reconstruction async" Ok.
-#####
-
-
+##### end
