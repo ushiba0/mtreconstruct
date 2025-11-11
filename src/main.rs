@@ -19,6 +19,7 @@ const BATCH_SIZE_DEFAULT: usize = 100000;
 static BATCH_SIZE: AtomicUsize = AtomicUsize::new(BATCH_SIZE_DEFAULT);
 static CAT_ASYNC: AtomicBool = AtomicBool::new(false);
 static FORCE_RECONSTRUCT: AtomicBool = AtomicBool::new(false);
+static DRY_RUN: AtomicBool = AtomicBool::new(false);
 
 fn set_loglevel(loglevel: &str) {
     std::env::set_var("RUST_LOG", loglevel);
@@ -42,6 +43,7 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     opts.optflag("h", "help", "Print this message.");
     opts.optopt("", "log", "One of error, warn, info, debug, trace.", "");
     opts.optflag("v", "verbose", "Same as --log debug.");
+    opts.optflag("", "dry-run", "");
     opts.optflag(
         "a",
         "async",
@@ -85,6 +87,12 @@ fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
         CAT_ASYNC.store(true, Ordering::Release);
     } else {
         CAT_ASYNC.store(false, Ordering::Release);
+    }
+
+    if matches.opt_present("dry-run") {
+        DRY_RUN.store(true, Ordering::Release);
+    } else {
+        DRY_RUN.store(false, Ordering::Release);
     }
 
     if matches.opt_present("batch-size") {
@@ -334,7 +342,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if CAT_ASYNC.load(Ordering::Acquire) {
         log::info!("Using tokio::io::copy().");
     }
-    log::debug!("Visiting child dir and finding all files to reconstruct.");
+    log::debug!("Finding all files to reconstruct.");
     let mut map = find_all_files_to_reconstruct()?;
 
     for (_, val) in map.iter_mut() {
@@ -350,6 +358,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let filename = key.clone();
         let handle = tokio::spawn(async move {
             log::debug!("Thread for reconstruct {filename} start working.");
+            if DRY_RUN.load(Ordering::Acquire) {
+                return;
+            }
             let thread_start_time = std::time::Instant::now();
             let file_num = fragment_filenames.len();
             let res = reconstruct_async(fragment_filenames).await;
@@ -367,7 +378,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log::warn!("Failed to rename {res} to {filename}. {e:?}")
                 }
             }
-            res
         });
         log::info!("Spawned tokio thread for reconstruct {key}");
         joinhandles.push(handle);
