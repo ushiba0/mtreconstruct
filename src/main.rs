@@ -3,13 +3,16 @@ mod visitdir;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use visitdir::VisitDir;
 
+use anyhow::anyhow;
 use clap::Parser;
 use regex::Regex;
+use tokio::task::JoinHandle;
 
 // Constants and command line options.
 const BATCH_SIZE_DEFAULT: usize = 100000;
@@ -45,8 +48,8 @@ struct Args {
     dry_run: bool,
 
     /// Use tokio::io::copy() instead of std::io::copy(). (May be slower than default.)
-    #[arg(short, long)]
-    r#async: bool,
+    #[arg(short = 'a', long = "async")]
+    runasync: bool,
 
     /// Maximum number of files that can be concatenated simultaneously.
     #[arg(short, long, default_value_t = BATCH_SIZE_DEFAULT as u64,  value_parser = clap::value_parser!(u64).range(2..))]
@@ -57,45 +60,42 @@ struct Args {
     force: bool,
 }
 
-fn init_logger(loglevel: &str) {
+fn init_logger(loglevel: &str) -> anyhow::Result<()> {
     use env_logger::Builder;
     use log::LevelFilter;
 
     let mut builder = Builder::from_default_env();
-    let mut level = LevelFilter::Info;
-
-    level = match loglevel.to_lowercase().as_str() {
+    let level = match loglevel.to_lowercase().as_str() {
         "error" => LevelFilter::Error,
         "warn" => LevelFilter::Warn,
         "info" => LevelFilter::Info,
         "debug" => LevelFilter::Debug,
         "trace" => LevelFilter::Trace,
-        _ => {
-            eprintln!("Invalid log level: {level}. Using 'info'.");
-            LevelFilter::Info
-        }
+        _ => return Err(anyhow!("Invalid log level: {}", loglevel)),
     };
 
     builder.filter_level(level).init();
+    Ok(())
 }
 
-fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
+fn parse_args() -> anyhow::Result<Arc<Args>> {
     let args = Args::parse();
 
-    if let Some(loglevel) = args.log {
-        init_logger(&loglevel);
+    let loglevel = if let Some(loglevel) = args.log.as_ref() {
+        loglevel.clone()
     } else if args.verbose {
-        init_logger("debug");
-    }else {
-        init_logger("warn");
-    }
+        "debug".to_string()
+    } else {
+        "warn".to_string()
+    };
+    init_logger(&loglevel)?;
 
-    CAT_ASYNC.store(args.r#async, Ordering::Release);
+    CAT_ASYNC.store(args.runasync, Ordering::Release);
     DRY_RUN.store(args.dry_run, Ordering::Release);
     BATCH_SIZE.store(args.batch_size as usize, Ordering::Release);
     FORCE_RECONSTRUCT.store(args.force, Ordering::Release);
 
-    Ok(())
+    Ok(Arc::new(args))
 }
 
 async fn delete_with_retry_async(path: &str, retry: usize, dur_ms: u64) {
@@ -209,7 +209,7 @@ pub async fn concatinate_async(files: &[String]) -> Result<(), Box<dyn std::erro
 ///
 /// For example, given "foo.txt.FRAG-001" and "foo.txt.FRAG-002",
 /// both will be grouped under the key "foo.txt".
-fn find_all_files_to_reconstruct() -> Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error>> {
+fn find_all_files_to_reconstruct() -> anyhow::Result<HashMap<String, Vec<String>>> {
     let re = Regex::new(r".FRAG-")?;
     let file_iter = VisitDir::new(".")?;
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
@@ -224,10 +224,7 @@ fn find_all_files_to_reconstruct() -> Result<HashMap<String, Vec<String>>, Box<d
 
         map.entry(file_key.clone())
             .and_modify(|files| files.push(filename.clone()))
-            .or_insert_with(|| {
-                log::debug!("Found file {file_key}");
-                vec![filename]
-            });
+            .or_insert_with(|| vec![filename]);
     }
 
     Ok(map)
@@ -235,11 +232,10 @@ fn find_all_files_to_reconstruct() -> Result<HashMap<String, Vec<String>>, Box<d
 
 // Concatinates files.
 // Returns filename.
-fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = String> + Send {
+fn reconstruct_async(fragment_filenames: Vec<String>, args: Arc<Args>) -> impl Future<Output = String> + Send {
     log::trace!("[reconstruct_async] {fragment_filenames:?}");
     async move {
-        let batch_size = BATCH_SIZE.load(Ordering::Acquire);
-        if fragment_filenames.len() <= batch_size {
+        if fragment_filenames.len() <= args.batch_size as usize {
             // Concatinate!
             let res = if CAT_ASYNC.load(Ordering::Acquire) {
                 concatinate_async(&fragment_filenames).await
@@ -256,9 +252,10 @@ fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = St
             fragment_filenames[0].clone()
         } else {
             let mut handles = Vec::new();
-            for chunk in fragment_filenames.chunks(batch_size) {
+            for chunk in fragment_filenames.chunks(args.batch_size as usize) {
                 let files = chunk.to_vec();
-                let handle = tokio::spawn(async move { reconstruct_async(files).await });
+                let args1 = args.clone();
+                let handle = tokio::spawn(async move { reconstruct_async(files, args1).await });
                 handles.push(handle);
             }
 
@@ -273,7 +270,8 @@ fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = St
                 }
             }
 
-            let handle = tokio::spawn(async move { reconstruct_async(files).await });
+            let args1: Arc<Args> = args.clone();
+            let handle = tokio::spawn(async move { reconstruct_async(files, args1).await });
 
             match handle.await {
                 Ok(filename) => filename,
@@ -318,13 +316,12 @@ fn verify_fragment_number(file_map: &mut HashMap<String, Vec<String>>) {
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     let start_time = std::time::Instant::now();
-
-    parse_args()?;
+    let args = parse_args()?;
 
     log::debug!("batch_size = {}", BATCH_SIZE.load(Ordering::Acquire));
-    if CAT_ASYNC.load(Ordering::Acquire) {
+    if args.runasync {
         log::info!("Using tokio::io::copy().");
     }
     log::debug!("Finding all files to reconstruct.");
@@ -336,33 +333,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     verify_fragment_number(&mut map);
 
-    let mut joinhandles = Vec::new();
+    let mut joinhandles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
 
     for (key, val) in map.iter() {
         let fragment_filenames = val.clone();
         let filename = key.clone();
+        let args1 = args.clone();
         let handle = tokio::spawn(async move {
             log::debug!("Thread for reconstruct {filename} start working.");
-            if DRY_RUN.load(Ordering::Acquire) {
-                return;
+            if args1.dry_run {
+                return Ok(());
             }
             let thread_start_time = std::time::Instant::now();
             let file_num = fragment_filenames.len();
-            let res = reconstruct_async(fragment_filenames).await;
+            let filename_reconstructed = reconstruct_async(fragment_filenames, args1).await;
             let elapsed = thread_start_time.elapsed().as_millis();
-            let meta = tokio::fs::metadata(&res).await.unwrap();
+            let meta = tokio::fs::metadata(&filename_reconstructed)
+                .await
+                .map_err(|e| anyhow!("Failed to get metadata of {filename_reconstructed}: {e}"))?;
             let size_mb = meta.len() / 1024 / 1024;
             log::info!(
-                "Reconstruction of {filename} completed. Total files = {file_num}, Size = {size_mb} Mib, Elapsed = {elapsed} ms."
+                "Reconstruction of {filename} completed. Total files = {file_num}, Size = {size_mb} MiB, Elapsed = {elapsed} ms."
             );
 
             // Rename file.
-            match tokio::fs::rename(&res, &filename).await {
-                Ok(_) => {}
-                Err(e) => {
-                    log::warn!("Failed to rename {res} to {filename}. {e:?}")
-                }
-            }
+            tokio::fs::rename(&filename_reconstructed, &filename)
+                .await
+                .map_err(|e| anyhow!("Failed to rename {filename}: {e}"))?;
+            Ok(())
         });
         log::info!("Spawned tokio thread for reconstruct {key}");
         joinhandles.push(handle);
@@ -370,9 +368,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for handle in joinhandles {
         match handle.await {
-            Ok(_) => {}
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                log::error!("Task error: {e}");
+            }
             Err(e) => {
-                eprintln!("Error {e:?}");
+                log::error!("JoinError: {e}");
             }
         }
     }
