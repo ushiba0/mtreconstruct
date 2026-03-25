@@ -47,20 +47,20 @@ main() {
   ##### Build mtreconstruct.
   pushd ..
   cargo fmt
-  cargo build --release
+  cargo build
   popd
   ##### 
 
 
   ##### Test for --help
-  time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS --help
+  time ../target/debug/mtreconstruct $COMMON_RECONSTRUCT_OPTS --help
   echo Test "--help" Ok.
   #####
 
 
   ##### Test for cat (std::io::copy())
   prepare_test_file
-  time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS
+  time ../target/debug/mtreconstruct $COMMON_RECONSTRUCT_OPTS
   checksum
   cleanup
   echo Test "Reconstruction default" Ok.
@@ -69,7 +69,7 @@ main() {
 
   ##### Test for cat (tokio::io::copy())
   prepare_test_file
-  time ../target/release/mtreconstruct $COMMON_RECONSTRUCT_OPTS --async
+  time ../target/debug/mtreconstruct $COMMON_RECONSTRUCT_OPTS --async
   checksum
   cleanup
   echo Test "Reconstruction async" Ok.

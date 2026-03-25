@@ -1,18 +1,15 @@
-extern crate env_logger;
-extern crate getopts;
-extern crate log;
-
 mod visitdir;
 
-use regex::Regex;
 use std::collections::HashMap;
-use std::env;
 use std::future::Future;
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use visitdir::VisitDir;
+
+use clap::Parser;
+use regex::Regex;
 
 // Constants and command line options.
 const BATCH_SIZE_DEFAULT: usize = 100000;
@@ -21,95 +18,82 @@ static CAT_ASYNC: AtomicBool = AtomicBool::new(false);
 static FORCE_RECONSTRUCT: AtomicBool = AtomicBool::new(false);
 static DRY_RUN: AtomicBool = AtomicBool::new(false);
 
-fn set_loglevel(loglevel: &str) {
-    unsafe {
-        std::env::set_var("RUST_LOG", loglevel);
-    }
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about,
+    help_template = "\
+{before-help}{name} {version}
+{author-with-newline}{about-with-newline}
+GitHub: https://github.com/ushiba0/mtreconstruct
+{usage-heading} {usage}
+
+{all-args}{after-help}"
+)]
+struct Args {
+    /// One of error, warn, info, debug, trace.
+    #[arg(long, value_name = "LEVEL")]
+    log: Option<String>,
+
+    /// Same as --log debug.
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Dry run mode.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Use tokio::io::copy() instead of std::io::copy(). (May be slower than default.)
+    #[arg(short, long)]
+    r#async: bool,
+
+    /// Maximum number of files that can be concatenated simultaneously.
+    #[arg(short, long, default_value_t = BATCH_SIZE_DEFAULT as u64,  value_parser = clap::value_parser!(u64).range(2..))]
+    batch_size: u64,
+
+    /// Forcibly concatenates files even if fragment numbers are not consecutive.
+    #[arg(short, long)]
+    force: bool,
 }
 
-fn print_usage(program: &str, opts: &getopts::Options) -> ! {
-    let brief = format!(
-        "Multithread reconstruction.
-Usage: {program}
-       {program} -n [NUMBER]"
-    );
-    print!("{}", opts.usage(&brief));
-    std::process::exit(0);
+fn init_logger(loglevel: &str) {
+    use env_logger::Builder;
+    use log::LevelFilter;
+
+    let mut builder = Builder::from_default_env();
+    let mut level = LevelFilter::Info;
+
+    level = match loglevel.to_lowercase().as_str() {
+        "error" => LevelFilter::Error,
+        "warn" => LevelFilter::Warn,
+        "info" => LevelFilter::Info,
+        "debug" => LevelFilter::Debug,
+        "trace" => LevelFilter::Trace,
+        _ => {
+            eprintln!("Invalid log level: {level}. Using 'info'.");
+            LevelFilter::Info
+        }
+    };
+
+    builder.filter_level(level).init();
 }
 
 fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    let program = args[0].clone();
-    let mut opts = getopts::Options::new();
+    let args = Args::parse();
 
-    opts.optflag("h", "help", "Print this message.");
-    opts.optopt("", "log", "One of error, warn, info, debug, trace.", "");
-    opts.optflag("v", "verbose", "Same as --log debug.");
-    opts.optflag("", "dry-run", "");
-    opts.optflag(
-        "a",
-        "async",
-        "Use tokio::io::copy() instad of std::io::copy(). \
-        (May be slower than default.)",
-    );
-    opts.optopt(
-        "b",
-        "batch-size",
-        &format!(
-            "(Default {BATCH_SIZE_DEFAULT}) Maximum \
-            number of files that can be concatenated simultaneously."
-        ),
-        "",
-    );
-    opts.optflag(
-        "f",
-        "force",
-        "The file suffixes are expected to be .FRAG-00000, \
-            .FRAG-00001, .FRAG-00002, and so on. By default, if the files do not match this pattern, \
-            reconstruction is skipped. The --force option bypasses this verification and forcibly \
-            concatenates the files.",
-    );
-
-    let matches = opts.parse(&args[1..])?;
-
-    if matches.opt_present("h") {
-        print_usage(&program, &opts);
+    if let Some(loglevel) = args.log {
+        init_logger(&loglevel);
+    } else if args.verbose {
+        init_logger("debug");
+    }else {
+        init_logger("warn");
     }
 
-    if matches.opt_present("log") {
-        let loglevel = matches.opt_str("log").unwrap_or_else(|| "info".to_string());
-        set_loglevel(&loglevel);
-    }
-
-    if matches.opt_present("v") {
-        set_loglevel("debug");
-    }
-
-    if matches.opt_present("async") {
-        CAT_ASYNC.store(true, Ordering::Release);
-    } else {
-        CAT_ASYNC.store(false, Ordering::Release);
-    }
-
-    if matches.opt_present("dry-run") {
-        DRY_RUN.store(true, Ordering::Release);
-    } else {
-        DRY_RUN.store(false, Ordering::Release);
-    }
-
-    if matches.opt_present("batch-size") {
-        let number_arg = matches.opt_str("batch-size").unwrap_or(format!("{}", BATCH_SIZE_DEFAULT));
-        let batch_size: usize = number_arg.parse()?;
-        if !(2..).contains(&batch_size) {
-            return Err("Invalid batch size.".into());
-        }
-        assert!(batch_size >= 2);
-        BATCH_SIZE.store(batch_size, Ordering::Release);
-    }
-
-    if matches.opt_present("f") {
-        FORCE_RECONSTRUCT.store(true, Ordering::Release);
-    }
+    CAT_ASYNC.store(args.r#async, Ordering::Release);
+    DRY_RUN.store(args.dry_run, Ordering::Release);
+    BATCH_SIZE.store(args.batch_size as usize, Ordering::Release);
+    FORCE_RECONSTRUCT.store(args.force, Ordering::Release);
 
     Ok(())
 }
@@ -142,10 +126,10 @@ async fn open_with_retry_async(path: &str, retry: usize, dur_ms: u64, opts: &tok
     panic!("File {path} open failed after {retry} retries.");
 }
 
-/// Append the content of file2 to file1.
+/// Append the content of file2, file3, ... to file1.
 /// file1 will be modified.
-/// file2.. will be removed.
-/// Returns String object of file1.
+/// file2, file3, ... will be removed.
+/// Returns String filename of file1.
 /// If opening a file fails, sleep a while and retries infinitely.
 async fn concatinate(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{Seek, SeekFrom};
@@ -181,10 +165,10 @@ async fn concatinate(files: &[String]) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// Append the content of file2 to file1.
+/// Append the content of file2, file3, ... to file1.
 /// file1 will be modified.
-/// file2.. will be removed.
-/// Returns String object of file1.
+/// file2, file3, ... will be removed.
+/// Returns String filename of file1.
 /// If opening a file fails, sleep a while and retries infinitely.
 pub async fn concatinate_async(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -305,7 +289,7 @@ fn reconstruct_async(fragment_filenames: Vec<String>) -> impl Future<Output = St
 /// Check whether the fragment numbers are consecutive.
 /// Example:
 ///     If .FRAG-00001 is missing, as in .FRAG-00000, .FRAG-00002, .FRAG-00003, ..., remove the key from file_map.
-fn verify_file_number(file_map: &mut HashMap<String, Vec<String>>) {
+fn verify_fragment_number(file_map: &mut HashMap<String, Vec<String>>) {
     let mut files_to_skip: Vec<String> = Vec::new();
 
     for (key, val) in file_map.iter() {
@@ -317,7 +301,7 @@ fn verify_file_number(file_map: &mut HashMap<String, Vec<String>>) {
 
             if number != index {
                 if FORCE_RECONSTRUCT.load(Ordering::Acquire) {
-                    log::warn!("File {key}.FRAG-{index:>05} is missing, but continue reconstruction.");
+                    log::warn!("File {key}.FRAG-{index:>05} is missing, but continuing reconstruction.");
                     break;
                 } else {
                     log::warn!("File {key}.FRAG-{index:>05} is missing. Skip reconstruction of {key}.");
@@ -338,7 +322,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = std::time::Instant::now();
 
     parse_args()?;
-    env_logger::init();
 
     log::debug!("batch_size = {}", BATCH_SIZE.load(Ordering::Acquire));
     if CAT_ASYNC.load(Ordering::Acquire) {
@@ -351,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         val.sort_unstable();
     }
 
-    verify_file_number(&mut map);
+    verify_fragment_number(&mut map);
 
     let mut joinhandles = Vec::new();
 
