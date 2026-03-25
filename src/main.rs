@@ -230,58 +230,49 @@ fn find_all_files_to_reconstruct() -> anyhow::Result<HashMap<String, Vec<String>
     Ok(map)
 }
 
-// Concatinates files.
-// Returns filename.
-fn reconstruct_async(fragment_filenames: Vec<String>, args: Arc<Args>) -> impl Future<Output = String> + Send {
-    log::trace!("[reconstruct_async] {fragment_filenames:?}");
-    async move {
-        if fragment_filenames.len() <= args.batch_size as usize {
-            // Concatinate!
-            let res = if CAT_ASYNC.load(Ordering::Acquire) {
-                concatinate_async(&fragment_filenames).await
-            } else {
-                concatinate(&fragment_filenames).await
-            };
-            match res {
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("Error while concatinate files {}.. {e:?}", fragment_filenames[0]);
-                    panic!();
-                }
-            }
-            fragment_filenames[0].clone()
-        } else {
-            let mut handles = Vec::new();
-            for chunk in fragment_filenames.chunks(args.batch_size as usize) {
-                let files = chunk.to_vec();
-                let args1 = args.clone();
-                let handle = tokio::spawn(async move { reconstruct_async(files, args1).await });
-                handles.push(handle);
-            }
+/// Concatinates files.
+/// Returns filename.
+async fn reconstruct_async(fragment_files: Vec<String>, args: Arc<Args>) -> anyhow::Result<String> {
+    log::trace!("[reconstruct_async] {fragment_files:?}");
 
-            let mut files = Vec::new();
-            for handle in handles {
-                match handle.await {
-                    Ok(filename) => files.push(filename),
-                    Err(e) => {
-                        log::error!("Error {e:?}");
-                        panic!();
-                    }
-                }
-            }
+    let mut queue1: Vec<String> = fragment_files;
+    let mut queue2: Vec<String> = Vec::new();
 
-            let args1: Arc<Args> = args.clone();
-            let handle = tokio::spawn(async move { reconstruct_async(files, args1).await });
+    loop {
+        let mut handles: Vec<JoinHandle<String>> = Vec::new();
 
-            match handle.await {
-                Ok(filename) => filename,
-                Err(e) => {
-                    log::error!("Error {e:?}");
-                    panic!();
-                }
-            }
+        // Reconstruct files in queue1.
+        for chunk in queue1.chunks(args.batch_size as usize) {
+            let files = chunk.to_vec();
+            let args1 = args.clone();
+            let handle = tokio::spawn(async move {
+                let a = if args1.runasync {
+                    concatinate_async(&files).await
+                } else {
+                    concatinate(&files).await
+                };
+                _ = a;
+                files[0].clone()
+            });
+            handles.push(handle);
+        }
+
+        // Put the reconstructed files to queue2.
+        for handle in handles {
+            let filename = handle.await?;
+            queue2.push(filename);
+        }
+
+        // Then swap queue1 and queue2.
+        queue1.clear();
+        queue1.append(&mut queue2);
+
+        if queue1.len() == 1 {
+            break;
         }
     }
+
+    Ok(queue1[0].clone())
 }
 
 /// Check whether the fragment numbers are consecutive.
@@ -346,7 +337,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let thread_start_time = std::time::Instant::now();
             let file_num = fragment_filenames.len();
-            let filename_reconstructed = reconstruct_async(fragment_filenames, args1).await;
+            let filename_reconstructed = reconstruct_async(fragment_filenames, args1).await?;
             let elapsed = thread_start_time.elapsed().as_millis();
             let meta = tokio::fs::metadata(&filename_reconstructed)
                 .await
