@@ -22,7 +22,9 @@ static FORCE_RECONSTRUCT: AtomicBool = AtomicBool::new(false);
 static DRY_RUN: AtomicBool = AtomicBool::new(false);
 
 fn set_loglevel(loglevel: &str) {
-    std::env::set_var("RUST_LOG", loglevel);
+    unsafe {
+        std::env::set_var("RUST_LOG", loglevel);
+    }
 }
 
 fn print_usage(program: &str, opts: &getopts::Options) -> ! {
