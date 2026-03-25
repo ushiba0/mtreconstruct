@@ -1,12 +1,8 @@
 mod visitdir;
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use visitdir::VisitDir;
 
 use anyhow::anyhow;
@@ -16,10 +12,6 @@ use tokio::task::JoinHandle;
 
 // Constants and command line options.
 const BATCH_SIZE_DEFAULT: usize = 100000;
-static BATCH_SIZE: AtomicUsize = AtomicUsize::new(BATCH_SIZE_DEFAULT);
-static CAT_ASYNC: AtomicBool = AtomicBool::new(false);
-static FORCE_RECONSTRUCT: AtomicBool = AtomicBool::new(false);
-static DRY_RUN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -90,11 +82,6 @@ fn parse_args() -> anyhow::Result<Arc<Args>> {
     };
     init_logger(&loglevel)?;
 
-    CAT_ASYNC.store(args.runasync, Ordering::Release);
-    DRY_RUN.store(args.dry_run, Ordering::Release);
-    BATCH_SIZE.store(args.batch_size as usize, Ordering::Release);
-    FORCE_RECONSTRUCT.store(args.force, Ordering::Release);
-
     Ok(Arc::new(args))
 }
 
@@ -109,21 +96,29 @@ async fn delete_with_retry_async(path: &str, retry: usize, dur_ms: u64) {
             }
         }
     }
-    panic!("File {path} remove failed after {retry} retries.");
+    log::error!("Failed to remove file {path} after {retry} retries. Giving up.");
 }
 
-async fn open_with_retry_async(path: &str, retry: usize, dur_ms: u64, opts: &tokio::fs::OpenOptions) -> tokio::fs::File {
-    for _ in 0..retry {
+async fn open_with_retry_async(
+    path: &str,
+    retry: usize,
+    dur_ms: u64,
+    opts: &tokio::fs::OpenOptions,
+) -> anyhow::Result<tokio::fs::File> {
+    for loop_count in 1..=retry {
         match opts.open(path).await {
-            Ok(f) => return f,
+            Ok(f) => return Ok(f),
             Err(e) => {
+                if loop_count == retry {
+                    return Err(anyhow!("Failed to open {path}: {e:?}"));
+                }
                 log::warn!("File {path} open failed. {e:?} Retry in {dur_ms} ms.");
                 let duration = tokio::time::Duration::from_millis(dur_ms);
                 tokio::time::sleep(duration).await;
             }
         }
     }
-    panic!("File {path} open failed after {retry} retries.");
+    unreachable!();
 }
 
 /// Append the content of file2, file3, ... to file1.
@@ -131,23 +126,25 @@ async fn open_with_retry_async(path: &str, retry: usize, dur_ms: u64, opts: &tok
 /// file2, file3, ... will be removed.
 /// Returns String filename of file1.
 /// If opening a file fails, sleep a while and retries infinitely.
-async fn concatinate(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+async fn concatinate(files: &[String]) -> anyhow::Result<String> {
     use std::io::{Seek, SeekFrom};
 
-    if files.len() <= 1 {
-        return Ok(());
+    if files.len() == 0 {
+        panic!("(BUG) empty files.");
+    } else if files.len() <= 1 {
+        return Ok(files[0].clone());
     }
 
     let mut wopts = tokio::fs::OpenOptions::new();
     wopts.write(true).create(false).append(true);
-    let mut file1 = open_with_retry_async(&files[0], 10, 1000, &wopts).await.into_std().await;
+    let mut file1 = open_with_retry_async(&files[0], 10, 1000, &wopts).await?.into_std().await;
 
     // Open files[1], files[2], ... and append them to files[0].
     for src_path in files.iter().skip(1) {
         // Open file.
         let mut ropts = tokio::fs::OpenOptions::new();
         ropts.read(true);
-        let mut src = open_with_retry_async(src_path, 10, 1000, &ropts).await.into_std().await;
+        let mut src = open_with_retry_async(src_path, 10, 1000, &ropts).await?.into_std().await;
 
         // Seek to start (念のため).
         let _ = src.seek(SeekFrom::Start(0));
@@ -162,7 +159,7 @@ async fn concatinate(files: &[String]) -> Result<(), Box<dyn std::error::Error>>
 
     file1.flush()?;
 
-    Ok(())
+    Ok(files[0].clone())
 }
 
 /// Append the content of file2, file3, ... to file1.
@@ -170,23 +167,25 @@ async fn concatinate(files: &[String]) -> Result<(), Box<dyn std::error::Error>>
 /// file2, file3, ... will be removed.
 /// Returns String filename of file1.
 /// If opening a file fails, sleep a while and retries infinitely.
-pub async fn concatinate_async(files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn concatinate_async(files: &[String]) -> anyhow::Result<String> {
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-    if files.len() <= 1 {
-        return Ok(());
+    if files.len() == 0 {
+        panic!("(BUG) empty files.");
+    } else if files.len() <= 1 {
+        return Ok(files[0].clone());
     }
 
     let mut wopts = tokio::fs::OpenOptions::new();
     wopts.write(true).create(false).append(true);
-    let mut file1 = open_with_retry_async(&files[0], 10, 1000, &wopts).await;
+    let mut file1 = open_with_retry_async(&files[0], 10, 1000, &wopts).await?;
 
     // Open files[1], files[2], ... and append them to files[0].
     for src_path in files.iter().skip(1) {
         // Open file.
         let mut ropts = tokio::fs::OpenOptions::new();
         ropts.read(true);
-        let mut src = open_with_retry_async(src_path, 10, 1000, &ropts).await;
+        let mut src = open_with_retry_async(src_path, 10, 1000, &ropts).await?;
 
         // Seek to start (念のため).
         let _ = src.seek(std::io::SeekFrom::Start(0)).await?;
@@ -201,7 +200,7 @@ pub async fn concatinate_async(files: &[String]) -> Result<(), Box<dyn std::erro
 
     file1.flush().await?;
 
-    Ok(())
+    Ok(files[0].to_string())
 }
 
 /// Find all files to reconstruct.
@@ -246,12 +245,11 @@ async fn reconstruct_async(fragment_files: Vec<String>, args: Arc<Args>) -> anyh
             let files = chunk.to_vec();
             let args1 = args.clone();
             let handle = tokio::spawn(async move {
-                let a = if args1.runasync {
-                    concatinate_async(&files).await
+                if args1.runasync {
+                    let _a = concatinate_async(&files).await;
                 } else {
-                    concatinate(&files).await
+                    let _b = concatinate(&files).await;
                 };
-                _ = a;
                 files[0].clone()
             });
             handles.push(handle);
@@ -278,7 +276,7 @@ async fn reconstruct_async(fragment_files: Vec<String>, args: Arc<Args>) -> anyh
 /// Check whether the fragment numbers are consecutive.
 /// Example:
 ///     If .FRAG-00001 is missing, as in .FRAG-00000, .FRAG-00002, .FRAG-00003, ..., remove the key from file_map.
-fn verify_fragment_number(file_map: &mut HashMap<String, Vec<String>>) {
+fn verify_fragment_number(file_map: &mut HashMap<String, Vec<String>>, args: &Arc<Args>) {
     let mut files_to_skip: Vec<String> = Vec::new();
 
     for (key, val) in file_map.iter() {
@@ -289,7 +287,7 @@ fn verify_fragment_number(file_map: &mut HashMap<String, Vec<String>>) {
             let number = file_num.parse::<usize>().unwrap_or_default();
 
             if number != index {
-                if FORCE_RECONSTRUCT.load(Ordering::Acquire) {
+                if args.force {
                     log::warn!("File {key}.FRAG-{index:>05} is missing, but continuing reconstruction.");
                     break;
                 } else {
@@ -311,7 +309,6 @@ async fn main() -> anyhow::Result<()> {
     let start_time = std::time::Instant::now();
     let args = parse_args()?;
 
-    log::debug!("batch_size = {}", BATCH_SIZE.load(Ordering::Acquire));
     if args.runasync {
         log::info!("Using tokio::io::copy().");
     }
@@ -322,13 +319,11 @@ async fn main() -> anyhow::Result<()> {
         val.sort_unstable();
     }
 
-    verify_fragment_number(&mut map);
+    verify_fragment_number(&mut map, &args);
 
     let mut joinhandles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
 
-    for (key, val) in map.iter() {
-        let fragment_filenames = val.clone();
-        let filename = key.clone();
+    for (filename, fragment_files) in map {
         let args1 = args.clone();
         let handle = tokio::spawn(async move {
             log::debug!("Thread for reconstruct {filename} start working.");
@@ -336,8 +331,8 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             let thread_start_time = std::time::Instant::now();
-            let file_num = fragment_filenames.len();
-            let filename_reconstructed = reconstruct_async(fragment_filenames, args1).await?;
+            let file_num = fragment_files.len();
+            let filename_reconstructed = reconstruct_async(fragment_files, args1).await?;
             let elapsed = thread_start_time.elapsed().as_millis();
             let meta = tokio::fs::metadata(&filename_reconstructed)
                 .await
@@ -353,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow!("Failed to rename {filename}: {e}"))?;
             Ok(())
         });
-        log::info!("Spawned tokio thread for reconstruct {key}");
+        log::info!("Spawned tokio thread.");
         joinhandles.push(handle);
     }
 
