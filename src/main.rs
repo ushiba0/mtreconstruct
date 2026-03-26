@@ -85,13 +85,15 @@ fn parse_args() -> anyhow::Result<Arc<Args>> {
     Ok(Arc::new(args))
 }
 
-async fn delete_with_retry_async(path: &str, retry: usize, dur_ms: u64) {
+async fn delete_with_retry(path: &str) {
+    let retry = 10; // 10 times retry
+    let wait_ms = 1000; // Waits 1000 ms if remove fails.
     for _ in 0..retry {
         match tokio::fs::remove_file(path).await {
             Ok(_) => return,
             Err(e) => {
-                log::warn!("File {path} remove failed. {e:?} Retry in {dur_ms} ms.");
-                let duration = tokio::time::Duration::from_millis(dur_ms);
+                log::warn!("File {path} remove failed. {e:?} Retry in {wait_ms} ms.");
+                let duration = tokio::time::Duration::from_millis(wait_ms);
                 tokio::time::sleep(duration).await;
             }
         }
@@ -99,26 +101,27 @@ async fn delete_with_retry_async(path: &str, retry: usize, dur_ms: u64) {
     log::error!("Failed to remove file {path} after {retry} retries. Giving up.");
 }
 
-async fn open_with_retry_async(
-    path: &str,
-    retry: usize,
-    dur_ms: u64,
-    opts: &tokio::fs::OpenOptions,
-) -> anyhow::Result<tokio::fs::File> {
-    for loop_count in 1..=retry {
-        match opts.open(path).await {
+async fn open_with_retry(path: &str, opts: &tokio::fs::OpenOptions) -> anyhow::Result<tokio::fs::File> {
+    let retry = 10; // 10 times retry
+    let wait_ms = 1000; // Waits 1000 ms if open fails.
+    let mut loop_count = 0;
+    let err = loop {
+        let err = match opts.open(path).await {
             Ok(f) => return Ok(f),
-            Err(e) => {
-                if loop_count == retry {
-                    return Err(anyhow!("Failed to open {path}: {e:?}"));
-                }
-                log::warn!("File {path} open failed. {e:?} Retry in {dur_ms} ms.");
-                let duration = tokio::time::Duration::from_millis(dur_ms);
-                tokio::time::sleep(duration).await;
-            }
+            Err(e) => e,
+        };
+
+        if loop_count == retry {
+            break err;
         }
-    }
-    unreachable!();
+        loop_count += 1;
+
+        log::warn!("File {path} open failed. {err} Will retry in {wait_ms} ms.");
+        let duration = tokio::time::Duration::from_millis(wait_ms);
+        tokio::time::sleep(duration).await;
+    };
+    log::error!("Failed to remove {path}: {err}");
+    Err(anyhow!("Failed to remove {path}: {err}"))
 }
 
 /// Append the content of file2, file3, ... to file1.
@@ -137,14 +140,14 @@ async fn concatinate(files: &[String]) -> anyhow::Result<String> {
 
     let mut wopts = tokio::fs::OpenOptions::new();
     wopts.write(true).create(false).append(true);
-    let mut file1 = open_with_retry_async(&files[0], 10, 1000, &wopts).await?.into_std().await;
+    let mut file1 = open_with_retry(&files[0], &wopts).await?.into_std().await;
 
     // Open files[1], files[2], ... and append them to files[0].
     for src_path in files.iter().skip(1) {
         // Open file.
         let mut ropts = tokio::fs::OpenOptions::new();
         ropts.read(true);
-        let mut src = open_with_retry_async(src_path, 10, 1000, &ropts).await?.into_std().await;
+        let mut src = open_with_retry(src_path, &ropts).await?.into_std().await;
 
         // Seek to start (念のため).
         let _ = src.seek(SeekFrom::Start(0));
@@ -154,7 +157,7 @@ async fn concatinate(files: &[String]) -> anyhow::Result<String> {
 
         // Remove src file.
         drop(src);
-        delete_with_retry_async(src_path, 10, 1000).await;
+        delete_with_retry(src_path).await;
     }
 
     file1.flush()?;
@@ -178,14 +181,14 @@ pub async fn concatinate_async(files: &[String]) -> anyhow::Result<String> {
 
     let mut wopts = tokio::fs::OpenOptions::new();
     wopts.write(true).create(false).append(true);
-    let mut file1 = open_with_retry_async(&files[0], 10, 1000, &wopts).await?;
+    let mut file1 = open_with_retry(&files[0], &wopts).await?;
 
     // Open files[1], files[2], ... and append them to files[0].
     for src_path in files.iter().skip(1) {
         // Open file.
         let mut ropts = tokio::fs::OpenOptions::new();
         ropts.read(true);
-        let mut src = open_with_retry_async(src_path, 10, 1000, &ropts).await?;
+        let mut src = open_with_retry(src_path, &ropts).await?;
 
         // Seek to start (念のため).
         let _ = src.seek(std::io::SeekFrom::Start(0)).await?;
@@ -195,7 +198,7 @@ pub async fn concatinate_async(files: &[String]) -> anyhow::Result<String> {
 
         // Remove src file.
         drop(src);
-        delete_with_retry_async(src_path, 10, 1000).await;
+        delete_with_retry(src_path).await;
     }
 
     file1.flush().await?;
