@@ -5,7 +5,7 @@ use std::io::Write;
 use std::sync::Arc;
 use visitdir::VisitDir;
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use clap::Parser;
 use regex::Regex;
 use tokio::task::JoinHandle;
@@ -86,8 +86,8 @@ fn parse_args() -> anyhow::Result<Arc<Args>> {
 }
 
 async fn delete_with_retry(path: &str) {
-    let retry = 10; // 10 times retry
-    let wait_ms = 1000; // Waits 1000 ms if remove fails.
+    let retry = 1000; // Retries for `retry` times.
+    let wait_ms = 5000; // Waits ms if remove fails.
     for _ in 0..retry {
         match tokio::fs::remove_file(path).await {
             Ok(_) => return,
@@ -102,8 +102,8 @@ async fn delete_with_retry(path: &str) {
 }
 
 async fn open_with_retry(path: &str, opts: &tokio::fs::OpenOptions) -> anyhow::Result<tokio::fs::File> {
-    let retry = 10; // 10 times retry
-    let wait_ms = 1000; // Waits 1000 ms if open fails.
+    let retry = 1000; // Retries for `retry` times.
+    let wait_ms = 5000; // Waits ms if open fails.
     let mut loop_count = 0;
     let err = loop {
         let err = match opts.open(path).await {
@@ -217,11 +217,12 @@ fn find_all_files_to_reconstruct() -> anyhow::Result<HashMap<String, Vec<String>
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
 
     for entry in file_iter {
-        let filename = entry?.path().to_string_lossy().into_owned();
+        let filename = entry?.path().to_str().context("UEF8 error in file name")?.to_string();
         if !re.is_match(&filename) {
             continue;
         }
 
+        // Unwrap is safe because previous if-block ensures ".FRAG-" contains.
         let file_key = filename.split(".FRAG-").next().unwrap().to_string();
 
         map.entry(file_key.clone())

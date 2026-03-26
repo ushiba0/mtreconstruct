@@ -59,6 +59,7 @@ main() {
 
 
   ##### Test for cat (std::io::copy())
+  echo "Preparing test files."
   prepare_test_file
   time ../target/debug/mtreconstruct $COMMON_RECONSTRUCT_OPTS
   checksum
@@ -68,6 +69,7 @@ main() {
 
 
   ##### Test for cat (tokio::io::copy())
+  echo "Preparing test files."
   prepare_test_file
   time ../target/debug/mtreconstruct $COMMON_RECONSTRUCT_OPTS --async
   checksum
