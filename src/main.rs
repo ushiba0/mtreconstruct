@@ -1,8 +1,8 @@
 mod visitdir;
 
-use std::collections::HashMap;
-use std::io::Write;
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::{collections::BTreeMap, io::Write};
 use visitdir::VisitDir;
 
 use anyhow::{Context, anyhow};
@@ -211,10 +211,10 @@ pub async fn concatinate_async(files: &[String]) -> anyhow::Result<String> {
 ///
 /// For example, given "foo.txt.FRAG-001" and "foo.txt.FRAG-002",
 /// both will be grouped under the key "foo.txt".
-fn find_all_files_to_reconstruct() -> anyhow::Result<HashMap<String, Vec<String>>> {
+fn find_all_files_to_reconstruct() -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
     let re = Regex::new(r".FRAG-")?;
     let file_iter = VisitDir::new(".")?;
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for entry in file_iter {
         let filename = entry?.path().to_str().context("UEF8 error in file name")?.to_string();
@@ -226,8 +226,14 @@ fn find_all_files_to_reconstruct() -> anyhow::Result<HashMap<String, Vec<String>
         let file_key = filename.split(".FRAG-").next().unwrap().to_string();
 
         map.entry(file_key.clone())
-            .and_modify(|files| files.push(filename.clone()))
-            .or_insert_with(|| vec![filename]);
+            .and_modify(|files| {
+                files.insert(filename.clone());
+            })
+            .or_insert_with(|| {
+                let mut set = BTreeSet::new();
+                set.insert(filename);
+                set
+            });
     }
 
     Ok(map)
@@ -235,10 +241,10 @@ fn find_all_files_to_reconstruct() -> anyhow::Result<HashMap<String, Vec<String>
 
 /// Concatinates files.
 /// Returns filename.
-async fn reconstruct_async(fragment_files: Vec<String>, args: Arc<Args>) -> anyhow::Result<String> {
+async fn reconstruct_async(fragment_files: BTreeSet<String>, args: Arc<Args>) -> anyhow::Result<String> {
     log::trace!("[reconstruct_async] {fragment_files:?}");
 
-    let mut queue1: Vec<String> = fragment_files;
+    let mut queue1: Vec<String> = fragment_files.into_iter().collect::<Vec<String>>();
     let mut queue2: Vec<String> = Vec::new();
 
     loop {
@@ -280,7 +286,7 @@ async fn reconstruct_async(fragment_files: Vec<String>, args: Arc<Args>) -> anyh
 /// Check whether the fragment numbers are consecutive.
 /// Example:
 ///     If .FRAG-00001 is missing, as in .FRAG-00000, .FRAG-00002, .FRAG-00003, ..., remove the key from file_map.
-fn verify_fragment_number(file_map: &mut HashMap<String, Vec<String>>, args: &Arc<Args>) {
+fn verify_fragment_number(file_map: &mut BTreeMap<String, BTreeSet<String>>, args: &Arc<Args>) {
     let mut files_to_skip: Vec<String> = Vec::new();
 
     for (key, val) in file_map.iter() {
@@ -313,15 +319,8 @@ async fn main() -> anyhow::Result<()> {
     let start_time = std::time::Instant::now();
     let args = parse_args()?;
 
-    if args.runasync {
-        log::info!("Using tokio::io::copy().");
-    }
     log::debug!("Finding all files to reconstruct.");
     let mut map = find_all_files_to_reconstruct()?;
-
-    for (_, val) in map.iter_mut() {
-        val.sort_unstable();
-    }
 
     verify_fragment_number(&mut map, &args);
 
