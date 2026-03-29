@@ -310,13 +310,14 @@ async fn main() -> anyhow::Result<()> {
     let mut map = find_all_files_to_reconstruct()?;
 
     verify_fragment_number(&mut map, &args);
+    log::debug!("Took {} ms to find all files to reconstruct.", start_time.elapsed().as_millis());
 
     let mut joinhandles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
 
     for (filename, fragment_files) in map {
         let args1 = args.clone();
         let handle = tokio::spawn(async move {
-            log::debug!("Thread for reconstruct {filename} start working.");
+            log::info!("Thread for reconstruct {filename} start working.");
             if args1.dry_run {
                 return Ok(());
             }
@@ -329,17 +330,18 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow!("Failed to get metadata of {filename_reconstructed}: {e}"))?;
             let size_mb = meta.len() / 1024 / 1024;
-            log::info!(
-                "Reconstruction of {filename} completed. Total files = {file_num}, Size = {size_mb} MiB, Elapsed = {elapsed} ms."
-            );
+            let speed_mbps = meta.len() as u128 / elapsed / 1024; // MBps
 
             // Rename file.
             tokio::fs::rename(&filename_reconstructed, &filename)
                 .await
                 .map_err(|e| anyhow!("Failed to rename {filename}: {e}"))?;
+
+            log::info!(
+                "Reconstruction of {filename} completed. Total {file_num} files ({size_mb} MiB), Took {elapsed} ms ({speed_mbps} MB/s)."
+            );
             Ok(())
         });
-        log::info!("Spawned tokio thread.");
         joinhandles.push(handle);
     }
 
