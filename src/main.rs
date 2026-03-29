@@ -17,7 +17,7 @@ use visitdir::VisitDir;
 const BATCH_SIZE_DEFAULT: usize = 100000;
 const DURATION: tokio::time::Duration = tokio::time::Duration::from_millis(5_000);
 
-static FILES_TO_DELETE: Mutex<Lazy<BTreeSet<String>>> = Mutex::new(Lazy::new(|| BTreeSet::new()));
+static FILES_TO_DELETE: Mutex<Lazy<BTreeSet<String>>> = Mutex::new(Lazy::new(BTreeSet::new));
 
 #[derive(Parser, Debug)]
 #[command(
@@ -330,7 +330,7 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow!("Failed to get metadata of {filename_reconstructed}: {e}"))?;
             let size_mb = meta.len() / 1024 / 1024;
-            let speed_mbps = meta.len() as u128 / elapsed / 1024; // MBps
+            let speed_mbps = meta.len() as u128 / (elapsed + 1) / 1024; // MBps
 
             // Rename file.
             tokio::fs::rename(&filename_reconstructed, &filename)

@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR=$(dirname "${BASH_SOURCE:-0}")
 FILE1="bigfile.bin"
 DIR1="dir1"
-COMMON_RECONSTRUCT_OPTS="--log debug -b 10"
+COMMON_RECONSTRUCT_OPTS="--log debug -b 100"
 
 cleanup() {
   ## Clean up
