@@ -15,7 +15,7 @@ use visitdir::VisitDir;
 
 // Constants and command line options.
 const BATCH_SIZE_DEFAULT: usize = 100000;
-const DURATION: tokio::time::Duration = tokio::time::Duration::from_millis(5_000);
+const DURATION_5S: tokio::time::Duration = tokio::time::Duration::from_millis(5_000);
 
 static FILES_TO_DELETE: Mutex<Lazy<BTreeSet<String>>> = Mutex::new(Lazy::new(BTreeSet::new));
 
@@ -116,7 +116,7 @@ async fn open_with_retry(path: &str, opts: &tokio::fs::OpenOptions) -> anyhow::R
         loop_count += 1;
 
         log::warn!("File {path} open failed. {err} Will retry...");
-        tokio::time::sleep(DURATION).await;
+        tokio::time::sleep(DURATION_5S).await;
     };
     log::error!("Failed to remove {path}: {err}");
     Err(anyhow!("Failed to remove {path}: {err}"))
