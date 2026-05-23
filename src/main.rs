@@ -64,11 +64,11 @@ fn init_logger(loglevel: &str) -> anyhow::Result<()> {
 
     let mut builder = Builder::from_default_env();
     let level = match loglevel.to_lowercase().as_str() {
-        "error" => LevelFilter::Error,
+        "error" | "err" => LevelFilter::Error,
         "warn" => LevelFilter::Warn,
         "info" => LevelFilter::Info,
-        "debug" => LevelFilter::Debug,
-        "trace" => LevelFilter::Trace,
+        "debug" | "verbose" => LevelFilter::Debug,
+        "trace" | "trivia" => LevelFilter::Trace,
         _ => return Err(anyhow!("Invalid log level: {}", loglevel)),
     };
 
@@ -92,12 +92,9 @@ fn parse_args() -> anyhow::Result<Arc<Args>> {
 }
 
 async fn delete_with_retry(path: &str) {
-    match tokio::fs::remove_file(path).await {
-        Ok(_) => {}
-        Err(e) => {
-            log::warn!("File {path} remove failed. {e} Will retry...");
-            FILES_TO_DELETE.lock().unwrap().insert(path.to_string());
-        }
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        log::warn!("File {path} remove failed. {e} Will retry...");
+        FILES_TO_DELETE.lock().unwrap().insert(path.to_string());
     }
 }
 
@@ -204,22 +201,27 @@ fn find_all_files_to_reconstruct() -> anyhow::Result<BTreeMap<String, BTreeSet<S
     let file_iter = VisitDir::new(".")?;
     let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
-    for entry in file_iter {
-        let filename = entry?.path().to_str().context("UEF8 error in file name")?.to_string();
-        if !re.is_match(&filename) {
+    for entry_res in file_iter {
+        let entry = entry_res?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let pb = entry.path();
+        let path = pb.to_str().context("UTF8 Error")?;
+        if !re.is_match(path) {
             continue;
         }
 
         // Unwrap is safe because previous if-block ensures ".FRAG-" contains.
-        let file_key = filename.split(".FRAG-").next().unwrap().to_string();
+        let file_key = path.split(".FRAG-").next().unwrap().to_string();
 
         map.entry(file_key.clone())
             .and_modify(|files| {
-                files.insert(filename.clone());
+                files.insert(path.to_string());
             })
             .or_insert_with(|| {
                 let mut set = BTreeSet::new();
-                set.insert(filename);
+                set.insert(path.to_string());
                 set
             });
     }
@@ -230,7 +232,7 @@ fn find_all_files_to_reconstruct() -> anyhow::Result<BTreeMap<String, BTreeSet<S
 /// Concatinates files.
 /// Returns filename.
 async fn reconstruct_async(fragment_files: Vec<String>, args: Arc<Args>) -> anyhow::Result<String> {
-    log::trace!("[reconstruct_async] {fragment_files:?}");
+    log::trace!("Target files: {:?}...", &fragment_files[..3]);
 
     let mut queue1: Vec<String> = fragment_files;
     let mut queue2: Vec<String> = Vec::new();
@@ -360,7 +362,9 @@ async fn main() -> anyhow::Result<()> {
     let files_to_delete = FILES_TO_DELETE.lock().unwrap().clone();
     for filename in files_to_delete.iter() {
         log::warn!("Removing stale file {filename}");
-        let _ = tokio::fs::remove_file(filename).await;
+        if let Err(e) = tokio::fs::remove_file(filename).await {
+            log::error!("Failed to remove {filename}: {e}");
+        }
     }
 
     log::info!("Reconstruction completed. Elapsed {} ms", start_time.elapsed().as_millis());

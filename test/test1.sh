@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR=$(dirname "${BASH_SOURCE:-0}")
 FILE1="bigfile.bin"
 DIR1="dir1"
-COMMON_RECONSTRUCT_OPTS="--log debug -b 100"
+COMMON_RECONSTRUCT_OPTS="--log trace -b 100"
 
 cleanup() {
   ## Clean up
@@ -34,7 +34,7 @@ checksum() {
 
 prepare_test_file() {
   dd if=/dev/urandom of=$FILE1 bs=101M count=1 2> /dev/null > /dev/null
-  split -b 10k --numeric-suffixes=0 --suffix-length=5 $FILE1 ${FILE1}_result.FRAG- 2> /dev/null > /dev/null
+  split -b 100k --numeric-suffixes=0 --suffix-length=5 $FILE1 ${FILE1}_result.FRAG- 2> /dev/null > /dev/null
   mkdir $DIR1
   pushd $DIR1
   cp ../${FILE1}* .
