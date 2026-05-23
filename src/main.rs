@@ -118,8 +118,8 @@ async fn open_with_retry(path: &str, opts: &tokio::fs::OpenOptions) -> anyhow::R
         log::warn!("File {path} open failed. {err} Will retry...");
         tokio::time::sleep(DURATION_5S).await;
     };
-    log::error!("Failed to remove {path}: {err}");
-    Err(anyhow!("Failed to remove {path}: {err}"))
+    log::error!("Failed to open {path}: {err}");
+    Err(anyhow!("Failed to open {path}: {err}"))
 }
 
 /// Append the content of file[1], file[2], ... to file[0].
@@ -306,31 +306,31 @@ async fn main() -> anyhow::Result<()> {
     let start_time = std::time::Instant::now();
     let args = parse_args()?;
 
-    log::debug!("Finding all files to reconstruct.");
+    log::info!("Finding all files to reconstruct.");
     let mut map = find_all_files_to_reconstruct()?;
 
     verify_fragment_number(&mut map, &args);
-    log::debug!("Took {} ms to find all files to reconstruct.", start_time.elapsed().as_millis());
+    log::debug!("Took {} ms to find files.", start_time.elapsed().as_millis());
 
     let mut joinhandles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
 
     for (filename, fragment_files) in map {
         let args1 = args.clone();
         let handle = tokio::spawn(async move {
-            log::info!("Thread for reconstruct {filename} start working.");
+            log::info!("Thread for reconstruct {filename} spawned.");
             if args1.dry_run {
                 return Ok(());
             }
             let thread_start_time = std::time::Instant::now();
-            let file_num = fragment_files.len();
             let files = fragment_files.into_iter().collect::<Vec<String>>();
             let filename_reconstructed = reconstruct_async(files, args1).await?;
-            let elapsed = thread_start_time.elapsed().as_millis();
-            let meta = tokio::fs::metadata(&filename_reconstructed)
+            let elapsed_ms = std::cmp::max(thread_start_time.elapsed().as_micros(), 1) as f32 / 1000.0;
+            let size_mb = tokio::fs::metadata(&filename_reconstructed)
                 .await
-                .map_err(|e| anyhow!("Failed to get metadata of {filename_reconstructed}: {e}"))?;
-            let size_mb = meta.len() / 1024 / 1024;
-            let speed_mbps = meta.len() as u128 / (elapsed + 1) / 1024; // MBps
+                .map_err(|e| anyhow!("Failed to get metadata of {filename_reconstructed}: {e}"))?
+                .len() as f32
+                / (1024.0 * 1024.0);
+            let speed_mbps = size_mb / elapsed_ms * 1000.0;
 
             // Rename file.
             tokio::fs::rename(&filename_reconstructed, &filename)
@@ -338,7 +338,7 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow!("Failed to rename {filename}: {e}"))?;
 
             log::info!(
-                "Reconstruction of {filename} completed. Total {file_num} files ({size_mb} MiB), Took {elapsed} ms ({speed_mbps} MB/s)."
+                "Task completed. Size = {size_mb: <.2} MiB, Took {elapsed_ms: <.2} ms, Speed = {speed_mbps: <.2} MiB/s, File = {filename}"
             );
             Ok(())
         });
@@ -359,7 +359,7 @@ async fn main() -> anyhow::Result<()> {
 
     let files_to_delete = FILES_TO_DELETE.lock().unwrap().clone();
     for filename in files_to_delete.iter() {
-        log::info!("Removing stale file {filename}");
+        log::warn!("Removing stale file {filename}");
         let _ = tokio::fs::remove_file(filename).await;
     }
 
